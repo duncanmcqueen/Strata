@@ -303,6 +303,14 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
     }
 }
 
+bool doorbell_payload_ready(const uint32_t*, const float*, int64_t, const int32_t*, const float*, int64_t, uint32_t) {
+    return true;   // the ring's ordering after the payload holds on CUDA/HIP (see elementwise.hpp)
+}
+bool doorbell_wait_payload(const uint32_t*, const float*, int64_t, const int32_t*, const float*, int64_t, uint32_t,
+                           int) {
+    return true;
+}
+
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }

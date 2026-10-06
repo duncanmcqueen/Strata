@@ -105,6 +105,19 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 // and launch helpers; only the
 // capability query returns false.
 bool native_mmvq_supported(int ggml_type) noexcept;
+
+// SYCL: Q6_K weights in the reordered layout - the matrix's ql (128 bytes per block), then its qh (64), its scales
+// (16) and its d (2), each an array over every block in row order; the same bytes as the GGUF blocks.  The 210-byte
+// blocks leave a block's words 2-byte aligned, so the GGUF layout loads each 32-bit word as two 16-bit loads; reordered,
+// every word is one aligned load (1.4-1.8x the GEMV's speed on the A770, bitwise the same results).  An uploader
+// reorders a matrix's bytes on the host (`native_q6_k_reorder`) and registers its device pointer; `native_mmvq`,
+// `native_q6_k_*` and `dequant_f16`/`dequant_bf16` then read it in that layout.  Other readers of the raw blocks must not
+// be given a registered pointer.  Unregister before freeing.
+void native_q6_k_reorder(const void* blocks, void* out, std::size_t n_blocks);
+void native_q6_k_register_reordered(const void* weights, std::size_t n_blocks);
+void native_q6_k_unregister(const void* weights);
+// the matrix's block count when `weights` is a registered reordered matrix, else 0
+std::size_t native_q6_k_reordered_blocks(const void* weights);
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);

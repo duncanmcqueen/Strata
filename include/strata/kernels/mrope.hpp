@@ -56,6 +56,18 @@ __device__ __forceinline__ bool rope_tab_cs(const RopeTab& t, int p, int pair, f
     s = __ldg(t.sin + (size_t) p * 32 + pair);
     return true;
 }
+#elif defined(STRATA_USE_SYCL)
+// The SYCL port: the same two helpers without the CUDA read-through-cache load
+// (SYCL has no __ldg; an ordinary load is the portable form).
+inline int mrope_pos(const int32_t* tab, int pos, int pair) {
+    return tab ? tab[(size_t) pos * 3 + pair % 3] : pos;
+}
+inline bool rope_tab_cs(const RopeTab& t, int p, int pair, float& c, float& s) {
+    if (t.cos == nullptr || p < 0 || p >= t.max_pos) return false;
+    c = t.cos[(size_t) p * 32 + pair];
+    s = t.sin[(size_t) p * 32 + pair];
+    return true;
+}
 #endif
 
 }  // namespace strata::kernels

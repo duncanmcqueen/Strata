@@ -17,6 +17,7 @@ offers the same steps as tools.
 - How the engine works, every measured number, the API and all settings: [docs/DETAILS.md](docs/DETAILS.md) and
   the [paper](docs/paper/Strata-Paper.pdf).
 - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
+- Intel Arc (SYCL) build and port status: [docs/INTEL_SYCL.md](docs/INTEL_SYCL.md).
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
 - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a

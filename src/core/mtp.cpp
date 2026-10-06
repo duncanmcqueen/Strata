@@ -122,7 +122,12 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
-    if (dhead_) cudaFree(dhead_);
+    if (dhead_) {
+#if defined(STRATA_USE_SYCL)
+        strata::kernels::native_q6_k_unregister(dhead_);
+#endif
+        cudaFree(dhead_);
+    }
     if (dvocab_) cudaFree(dvocab_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
@@ -440,6 +445,22 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 return false;
             }
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+#if defined(STRATA_USE_SYCL)
+            if (const size_t nb = strata::kernels::native_q6_k_reordered_blocks(head->weights())) {
+                // a reordered Q6_K head (native_mmvq.hpp): a row's part of each of the four arrays is contiguous,
+                // so the subset gathers array by array into the same layout
+                const auto* src = (const uint8_t*) head->weights();
+                const int64_t bpr = row_bytes / 210, sub_nb = n_dvocab_ * bpr;
+                const int64_t part[4] = {128, 64, 16, 2};
+                int64_t src_off = 0, dst_off = 0;
+                for (const int64_t bytes : part) {
+                    strata::kernels::gather_rows(src + src_off, bpr * bytes, dvocab_, n_dvocab_, dhead_ + dst_off, nullptr);
+                    src_off += (int64_t) nb * bytes;
+                    dst_off += sub_nb * bytes;
+                }
+                strata::kernels::native_q6_k_register_reordered(dhead_, (size_t) sub_nb);
+            } else
+#endif
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();

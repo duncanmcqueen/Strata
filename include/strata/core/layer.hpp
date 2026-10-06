@@ -51,6 +51,8 @@ namespace strata::core {
 /// Configure before session capture; captured graphs retain the selected implementation.
 /// Does not change GR, PLE or the shared expert's scalar gate.
 void layer_set_native_bf16(bool enabled);
+/// whether the BF16 projections (the router's logits among them) run as bf16_gemv_fp32_mmvf
+bool layer_native_bf16();
 // Diagnostic vector-attention adapter; configure before capture, context <=256.
 void layer_set_native_flash_attn_short(bool enabled);
 

@@ -112,6 +112,18 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
 /// Plan v0.3 P3: the doorbell's payload and its ring in ONE kernel.  Copies `x` (n floats), `ids` and `weights`
 /// (k each) into the mapped host regions, fences, and increments the mapped sequence number - replacing three
 /// device-to-host memcpy nodes (copy-engine operations in the middle of the layer chain) and the ring kernel.
+/// After the ring, before the host reads the payload: true once the payload `doorbell_publish` wrote for ring `want`
+/// has fully reached the host.  On SYCL (Arc A770) the ring can become visible before the last activation stores do
+/// (measured: 14 of 2,832 rings in one run, and output that changed from run to run), so `doorbell_publish` also
+/// writes, next to the sequence number, the ring it belongs to and an exact checksum of the payload (the wrapping sum
+/// of the bit patterns of x, ids and weights) in slot r % 4 (seq[1 + 2 (r % 4)], seq[2 + 2 (r % 4)]: a split verify
+/// window publishes two rings before the host reads the first); this compares them with the host's view.  The
+/// sequence word therefore needs 9 words of mapped memory.  CUDA/HIP: always true (their ordering holds).
+bool doorbell_payload_ready(const uint32_t* h_seq, const float* h_x, int64_t n, const int32_t* h_ids,
+                            const float* h_weights, int64_t k, uint32_t want);
+/// Spins on doorbell_payload_ready for up to `timeout_ms`; false on timeout.
+bool doorbell_wait_payload(const uint32_t* h_seq, const float* h_x, int64_t n, const int32_t* h_ids,
+                           const float* h_weights, int64_t k, uint32_t want, int timeout_ms = 20000);
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream);
 

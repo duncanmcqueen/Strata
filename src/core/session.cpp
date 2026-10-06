@@ -703,6 +703,13 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
             return false;
         }
 
+        // the ring can arrive before its payload on some GPUs (elementwise.hpp): wait until it is whole
+        if (!strata::kernels::doorbell_wait_payload(s.db->h_seq, s.db->h_x_f, g.n_embd, s.db->h_ids, s.db->h_weights,
+                                                    k, want)) {
+            err = "session_loop: layer " + std::to_string(l) + " rang but its payload never arrived whole";
+            return false;
+        }
+
         // ---- **THE GPU'S HALF GOES FIRST, SO IT RUNS WHILE THE CPU DOES ITS HALF.**  `Launch` only enqueues:
         // the quantize and the grouped expert kernel land on `main_cs` and the GPU starts on them immediately,
         // while the host is still inside `pool` below.  Nothing here waits.
@@ -943,6 +950,11 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                 err = "session_run_token: timed out waiting for layer " + std::to_string(l);
                 return false;
             }
+        }
+        if (!strata::kernels::doorbell_wait_payload(s.db->h_seq, s.db->h_x_f, g.n_embd, s.db->h_ids, s.db->h_weights,
+                                                    s.k, want)) {
+            err = "session_run_token: layer " + std::to_string(l) + " rang but its payload never arrived whole";
+            return false;
         }
         const auto t1 = Clock::now();
         progress_at("token: the CPU experts of layer", l);

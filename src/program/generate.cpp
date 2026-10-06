@@ -397,7 +397,10 @@ struct Options {
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
-    int adapt_swaps = 96;
+    /// up to this many swaps per adaptation; < 0 (the default) = 96, or fewer on a link the PCIe probe measured
+    /// slow: the swaps keep the link time of 96 at 25 GB/s (~8 ms), at least 8 (Arc A770 on PCIe 3.0 x4, 1.9 GB/s:
+    /// 96 swaps 9.29 tok/s, 32 9.92, 8 10.04-10.32 - each swap is a ~2 MB copy the next window waits for)
+    int adapt_swaps = -1;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -1831,11 +1834,26 @@ int main(int argc, char** argv) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
+            if (o.adapt_swaps < 0 && bw < 25.0) {
+                o.adapt_swaps = std::max(8, (int) std::lround(96.0 * bw / 25.0));
+                std::fprintf(stderr, "strata generate: adaptive tier: up to %d swaps per adaptation on this link "
+                                     "(--adapt-swaps N overrides)\n", o.adapt_swaps);
+            }
         } else {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
+    if (o.adapt_swaps < 0) o.adapt_swaps = 96;
+#if defined(STRATA_USE_SYCL)
+    // SYCL: the prompt path borrows expert-cache slots as on CUDA/HIP (its GEMMs past 4 GiB into the cache are staged by
+    // the BLAS shim: sycl_runtime/blas.cpp).  STRATA_SYCL_PREFILL_OWN=1: its own buffers instead, held for the session,
+    // so `--prefill auto` then takes at most 2048-token chunks (8192 would keep ~5.8 GiB from the cache).
+    if (std::getenv("STRATA_SYCL_PREFILL_OWN") != nullptr) {
+        o.no_prefill_borrow = true;
+        if (o.prefill_auto && o.prefill_chunk > 2048) o.prefill_chunk = o.prefill_auto_max = 2048;
+    }
+#endif
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
@@ -2850,7 +2868,16 @@ int main(int argc, char** argv) {
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
         // the predicate a local `borrow` was here, hoisted above so both cache-size branches read the same one)
+#if defined(STRATA_USE_SYCL)
+        // SYCL keeps the prompt path's own buffers (no borrowing, see above): reserve exactly what they take -
+        // Prefill::bytes_needed counts what `carve` takes, the ring of whole expert blobs included.  The linear
+        // estimate below left an 8192-token chunk short by its ring; the over-committed card then hung a verify
+        // window on an Arc A770 (2 of 3 long-context runs).
+        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow)
+            ? (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk) >> 20) + 64 : 0;
+#else
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+#endif
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
@@ -2919,7 +2946,16 @@ int main(int argc, char** argv) {
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
+#if defined(STRATA_USE_SYCL)
+        // SYCL keeps the prompt path's own buffers (no borrowing, see above): reserve exactly what they take -
+        // Prefill::bytes_needed counts what `carve` takes, the ring of whole expert blobs included.  The linear
+        // estimate below left an 8192-token chunk short by its ring; the over-committed card then hung a verify
+        // window on an Arc A770 (2 of 3 long-context runs).
+        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow)
+            ? (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk) >> 20) + 64 : 0;
+#else
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+#endif
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
@@ -6685,6 +6721,10 @@ int main(int argc, char** argv) {
                         ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
+        if (const std::string pr = ver.profile_report(); !pr.empty())   // STRATA_VERIFY_PROFILE
+            std::printf("%-24s%s\n", "verify GPU stages", pr.c_str());
+        if (const std::string lr = ver.layer_report(); !lr.empty())     // STRATA_VERIFY_LAYER_MS
+            std::printf("%-24s per step (ms, host clock):%s\n", "verify layers", lr.c_str());
         if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
                         "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,

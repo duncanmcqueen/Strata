@@ -43,6 +43,23 @@
 #define STRATA_ROPE_SCALING_HD
 #endif
 
+// Device math for the helpers below.  On the SYCL device pass the libm float names
+// become IMPORTED device symbols, and the oneMKL-driven
+// -fsycl-allow-device-image-dependencies link leaves them for runtime resolution,
+// which fails for the AOT image ("No device image found for external symbol logf").
+// The sycl builtins are SPIR-V instructions and import nothing; they lower to the
+// same IGC implementations, inside the native path's 3e-3 parity tolerance.
+#if defined(__SYCL_DEVICE_ONLY__)
+#include <sycl/builtins.hpp>
+#define STRATA_ROPE_LOGF sycl::log
+#define STRATA_ROPE_COSF sycl::cos
+#define STRATA_ROPE_SINF sycl::sin
+#else
+#define STRATA_ROPE_LOGF logf
+#define STRATA_ROPE_COSF cosf
+#define STRATA_ROPE_SINF sinf
+#endif
+
 namespace strata::kernels {
 
 enum class RopeScalingType { None, Linear, YaRN };
@@ -155,10 +172,10 @@ STRATA_ROPE_SCALING_HD inline void rope_scaled_angle(float theta_extrap, float f
         const float ramp_mix = rope_yarn_ramp(corr_low, corr_high, pair) * ext_factor;
         theta = theta * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
         // "Get n-d magnitude scaling corrected for interpolation" - the log term only when correcting.
-        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        mscale *= 1.0f + 0.1f * STRATA_ROPE_LOGF(1.0f / freq_scale);
     }
-    cos_out = cosf(theta) * mscale;
-    sin_out = sinf(theta) * mscale;
+    cos_out = STRATA_ROPE_COSF(theta) * mscale;
+    sin_out = STRATA_ROPE_SINF(theta) * mscale;
 }
 
 /// The ONE validity rule for a resolved configuration, shared by the engine's startup check and every rotation

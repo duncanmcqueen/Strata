@@ -1396,7 +1396,18 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
         if (arena == nullptr) {
+#if defined(__linux__)
+            // 2 MiB aligned and marked for transparent huge pages before the copy faults it in: with THP's default
+            // defrag ("madvise") only a marked region compacts for huge pages, and with the page cache filling RAM an
+            // unmarked one stayed all 4 KiB pages (AnonHugePages 0 of 13 GiB, A770 PC).  The pool streams these
+            // bytes; 4 KiB pages stop the hardware prefetchers at every page (a 5-thread read of expert-sized chunks:
+            // 36 GB/s on 4 KiB pages, 40 on huge ones).  STRATA_RESIDENT_THP=0 leaves it unmarked.
+            if (posix_memalign(&arena, 2u << 20, (size_t) bytes) != 0) arena = nullptr;
+            static const bool thp = [] { const char* v = std::getenv("STRATA_RESIDENT_THP"); return !v || std::atoi(v) != 0; }();
+            if (arena != nullptr && thp) (void) madvise(arena, (size_t) bytes, MADV_HUGEPAGE);
+#else
             arena = std::malloc((size_t) bytes);
+#endif
             if (arena == nullptr) {
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;

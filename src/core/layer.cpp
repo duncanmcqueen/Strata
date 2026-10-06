@@ -172,6 +172,7 @@ if (w.has_offset || p.offset != nullptr) {            err = name + ": an S2 form
 if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);        return true;    }    s_gemv_q8k_split(xq8k, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);    return true;}}
 // namespace
 void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
+bool layer_native_bf16() { return native_bf16_projections; }
 void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
 namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false; }
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
@@ -456,7 +457,13 @@ bool layer_verify_compatible(std::string& why) {
     else return true;
     return false;
 }
-void layer_set_publish_kernel(bool enabled) { g_publish_kernel = enabled; }
+void layer_set_publish_kernel(bool enabled) {
+#if defined(STRATA_USE_SYCL)
+    (void) enabled;   // SYCL: the kernel also writes the payload checksum the host waits for (doorbell_payload_ready)
+#else
+    g_publish_kernel = enabled;
+#endif
+}
 void layer_set_fused_gdn(bool enabled) { g_fused_gdn = enabled; }
 void layer_set_fast_select(bool enabled) { g_fast_select = enabled; }
 void layer_set_fast_attn(bool enabled) { g_fast_attn = enabled; }
@@ -995,10 +1002,10 @@ namespace {}
 uint64_t doorbell_init(const ModelGeometry& g, int64_t k, Doorbell& db) {    db.n_embd = g.n_embd;    db.k = k;    uint64_t bytes = 0;
 // ONE region per field, each MAPPED PINNED, so the device and the host have different pointers to the same
 // bytes and no copy is needed to publish them.
-auto alloc = [&](size_t n, void** h, void** d, const char* what) {        if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
+auto alloc = [&](size_t n, void** h, void** d, const char* what) {        if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(64, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;   /* + the payload tag and checksum */    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
 void doorbell_free(Doorbell& db) {    if (db.h_x_f) cudaFreeHost(db.h_x_f);    if (db.h_ids) cudaFreeHost(db.h_ids);    if (db.h_weights) cudaFreeHost(db.h_weights);    if (db.h_seq) cudaFreeHost(db.h_seq);    if (db.h_flag) cudaFreeHost(db.h_flag);    db = Doorbell{};}
 void doorbell_reset(const Doorbell& db) {
-    if (db.h_seq) *db.h_seq = 0;
+    if (db.h_seq) for (int i = 0; i <= 8; ++i) db.h_seq[i] = 0;   // + the payload tags (doorbell_payload_ready)
     if (db.h_flag) *(volatile uint32_t*) db.h_flag = 0;
 }
 // ================================ THE TWO ENDS OF A TOKEN ================================

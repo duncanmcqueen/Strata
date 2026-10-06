@@ -2,6 +2,8 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include <cstdlib>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <climits>
@@ -13,7 +15,12 @@ namespace strata::core {
 
 NativeHead::~NativeHead() {
     if (scratch_) cudaFree(scratch_);
-    if (weights_) cudaFree(weights_);
+    if (weights_) {
+#if defined(STRATA_USE_SYCL)
+        strata::kernels::native_q6_k_unregister(weights_);
+#endif
+        cudaFree(weights_);
+    }
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
@@ -47,14 +54,29 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         cudaError_t status = cudaMalloc(&weights, bytes);
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
+#if defined(STRATA_USE_SYCL)
+        // Q6_K in the reordered layout (native_mmvq.hpp); STRATA_SYCL_Q6K_GGUF=1 keeps the GGUF layout
+        const bool reorder = tensor->type == 14 && std::getenv("STRATA_SYCL_Q6K_GGUF") == nullptr;
+        std::vector<uint8_t> reordered;
+        if (reorder) {
+            reordered.resize(bytes);
+            strata::kernels::native_q6_k_reorder(gguf.tensor_data(*tensor), reordered.data(), bytes / 210);
+        }
+        const void* source = reorder ? (const void*) reordered.data() : gguf.tensor_data(*tensor);
+#else
+        const void* source = gguf.tensor_data(*tensor);
+#endif
         if (status == cudaSuccess)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+            status = cudaMemcpy(weights, source, bytes, cudaMemcpyHostToDevice);
         if (status != cudaSuccess) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
             err = std::string("native head upload: ") + cudaGetErrorString(status);
             return false;
         }
+#if defined(STRATA_USE_SYCL)
+        if (reorder) strata::kernels::native_q6_k_register_reordered(weights, bytes / 210);
+#endif
         weights_ = weights;
         scratch_ = scratch;
         bytes_ = bytes;

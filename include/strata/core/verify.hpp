@@ -155,10 +155,17 @@ public:
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    struct LayerMs { double gpu = 0, pool = 0; int64_t n = 0; };
+    std::vector<LayerMs> layer_ms_;   // [T][G][kind 0 GDN / 1 QSA / 2 first step / 3 tail]
+    bool layer_ms_on_ = false;
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
+    /// STRATA_VERIFY_LAYER_MS=1 - host-clock timing per step of the windows since the last call: the GPU segment
+    /// before each ring (the host's previous flag, or the launch, to the ring: GPU work on the critical path), the
+    /// pool, and the tail (last flag to the window's end), averaged by layer kind, T and group count; empty when off.
+    std::string layer_report();
 
 private:
     bool capture(int T, std::string& err);

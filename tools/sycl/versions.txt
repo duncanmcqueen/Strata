@@ -1,0 +1,29 @@
+# Strata SYCL backend - pinned toolchain (benchmarks are only comparable against THIS set).
+# Host: Arch/CachyOS, kernel driver xe. Update by editing, never by letting a package
+# upgrade drift a test run.
+#
+# Recorded 2026-10-03 on the A770/B580 development PC.
+
+OS kernel              7.2.8-2-cachyos
+Kernel driver          xe  (i915 also loaded; xe bound)
+
+oneAPI DPC++ compiler  2026.1.1 (2026.1.1.20260724)   /opt/intel/oneapi/compiler/latest
+oneMKL                 2026.0 (INTEL_MKL_VERSION 20260100)  /opt/intel/oneapi/mkl/latest
+oneAPI Unified Runtime 1.17.39758 (over Level-Zero V2, per sycl-ls)
+Intel compute runtime  26.35.39758.10-1.1 (OpenCL NEO 26.35.39758, ocloc 26.35.39758)
+Level Zero loader      1.32.0-1
+
+# Cards in the test machine (sycl-ls, level_zero backend):
+#   level_zero:0  Arc B580  (Battlemage G21, 12 GB) - display card, keep out of test runs
+#   level_zero:1  Arc A770  (Alchemist DG2, 16 GB)  - the inference/test card
+#
+# Pin the inference card for every run:  ONEAPI_DEVICE_SELECTOR=level_zero:1
+# AOT device names: dg2-g10 (A770, alias acm-g10), bmg-g21 (B580).
+# A770 sub-group sizes: 8, 16, 32 - the backend requires 32 (checked at device enumeration).
+#
+# Required run-time environment (tools/sycl/env.sh sets these):
+#   UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1   allow >4 GB device allocations
+#   ZES_ENABLE_SYSMAN=1                        cudaMemGetInfo via ext_intel free_memory
+#   NEO_FP64_EMULATION=1                       fp64 aspect on DG2/BMG (emulated; the
+#                                              AOT side is -cl-fp64-gen-emu)
+# Locked memory: ulimit -l unlimited (pinned arena, as the CUDA build expects).

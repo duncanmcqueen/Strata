@@ -669,7 +669,16 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
+        // 12 equal row ranges per thread: an expert's rows cost more the more tokens it holds and an SMT sibling runs
+        // slower, so with 3 per thread a phase waited on its slowest range - the threads were busy 76% (gate/up) and
+        // 70% (down) of the phases (Ryzen 5 5600, 6 workers + host, an A770 verify window); with 12, 90% and 89%,
+        // and the pool's time per round fell from 141 to 123 ms.  Every row is computed whole by one thread, so the
+        // split does not change a bit.  STRATA_POOL_TASKS_PER_THREAD overrides it.
+        static const int tpt = [] {
+            const char* v = std::getenv("STRATA_POOL_TASKS_PER_THREAD");
+            return v && std::atoi(v) > 0 ? std::atoi(v) : 12;
+        }();
+        mtasks_ = tpt * threads;
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);

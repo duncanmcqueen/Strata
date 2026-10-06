@@ -198,6 +198,27 @@ def say(msg=""):
     print(msg, flush=True)
 
 
+def physical_cores():
+    """The physical core count from /proc/cpuinfo (Linux), or 0 when it cannot be read."""
+    try:
+        cores = set()
+        phys = core = None
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("physical id"):
+                phys = line.split(":", 1)[1].strip()
+            elif line.startswith("core id"):
+                core = line.split(":", 1)[1].strip()
+            elif not line.strip():
+                if core is not None:
+                    cores.add((phys, core))
+                phys = core = None
+        if core is not None:
+            cores.add((phys, core))
+        return len(cores)
+    except OSError:
+        return 0
+
+
 def step(n, title):
     say()
     say(f"=== Step {n}: {title} ===")
@@ -1626,6 +1647,126 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     return eng
 
 
+# ---- Intel Arc (SYCL): docs/INTEL_SYCL.md.  Linux, one card, compiled here with oneAPI DPC++ (no ready-made engine).
+# The ocloc AOT name of each architecture `sycl-ls --verbose` reports; an architecture missing here gets the spir64 JIT
+# image only (the driver compiles it at first use).
+SYCL_AOT = {"intel_gpu_acm_g10": "dg2-g10", "intel_gpu_acm_g11": "dg2-g11", "intel_gpu_acm_g12": "dg2-g12",
+            "intel_gpu_bmg_g21": "bmg-g21", "intel_gpu_bmg_g31": "bmg-g31"}
+# VRAM by name until the compiled engine's strata-device reports it (an A770 is 8 or 16 GB: the larger is assumed)
+SYCL_VRAM_GB = {"A770": 16, "A750": 8, "A580": 8, "A380": 6, "A310": 4, "B580": 12, "B570": 10, "B60": 24, "B50": 16,
+                "B70": 32}
+SYCL_ENV = {"UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS": "1", "ZES_ENABLE_SYSMAN": "1", "NEO_FP64_EMULATION": "1"}
+
+
+def oneapi_root() -> Path | None:
+    """The oneAPI install with the DPC++ compiler and oneMKL (ONEAPI_ROOT, else /opt/intel/oneapi), or None."""
+    for r in [os.environ.get("ONEAPI_ROOT"), "/opt/intel/oneapi"]:
+        if r and (Path(r) / "compiler" / "latest" / "bin" / "icpx").exists() and (Path(r) / "mkl" / "latest").is_dir():
+            return Path(r)
+    return None
+
+
+def oneapi_env(root: Path) -> dict:
+    """tools/sycl/env.sh's compiler and oneMKL paths, as environment updates."""
+    lib = [str(root / "compiler" / "latest" / "lib"), str(root / "mkl" / "latest" / "lib")]
+    return {"PATH": os.pathsep.join([str(root / "compiler" / "latest" / "bin"), os.environ.get("PATH", "")]),
+            "LD_LIBRARY_PATH": os.pathsep.join(lib + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep),
+            "CMAKE_PREFIX_PATH": os.pathsep.join([str(root / "mkl" / "latest" / "lib" / "cmake" / "mkl"),
+                                                  os.environ.get("CMAKE_PREFIX_PATH", "")]).rstrip(os.pathsep)}
+
+
+def intel_gpus() -> list[dict]:
+    """The Intel GPUs the Level Zero runtime enumerates, numbered as ONEAPI_DEVICE_SELECTOR=level_zero:N numbers them
+    (sycl-ls --verbose, one platform per card): index, name, arch (ocloc AOT name or ""), vram_gb (by name)."""
+    if WIN:
+        return []
+    root = oneapi_root()
+    tool = str(root / "compiler" / "latest" / "bin" / "sycl-ls") if root else shutil.which("sycl-ls")
+    if not tool or not Path(tool).exists():
+        return []
+    env = {**os.environ, **(oneapi_env(root) if root else {}), "ONEAPI_DEVICE_SELECTOR": "level_zero:*"}
+    try:
+        text = subprocess.run([tool, "--verbose"], capture_output=True, text=True, env=env, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    cards, cur = [], None
+    for line in text.splitlines():
+        t = line.strip()
+        if t.startswith("Platform [#"):
+            cur = None
+        elif t.startswith("Name") and ":" in t and "Level-Zero" not in t and cur is None:
+            cur = {"index": len(cards), "name": t.split(":", 1)[1].strip(), "arch": "", "driver": "level_zero"}
+        elif t.startswith("Architecture") and cur is not None:
+            raw = t.split(":", 1)[1].strip()
+            cur["arch_raw"] = raw
+            cur["arch"] = SYCL_AOT.get(raw, "")
+            short = next((k for k in SYCL_VRAM_GB if k in cur["name"]), None)
+            cur["vram_gb"] = float(SYCL_VRAM_GB.get(short, 8))
+            cards.append(cur)
+    for g in cards:
+        g["count"] = len(cards)
+    return cards
+
+
+def sycl_problem(g) -> str | None:
+    """Why setup will not use this Intel card, or None."""
+    if "Arc" not in g["name"] and "Graphics" not in g["name"]:
+        return "not an Intel Arc GPU"
+    return None
+
+
+def build_engine_sycl(gpu, llama) -> Path:
+    """Compile the SYCL engine for this Intel card into engine/ (again only when its source changed), with oneAPI."""
+    eng = ROOT / "engine"
+    eng.mkdir(exist_ok=True)
+    stamp = eng / "BUILD.json"
+    meta = json.loads(stamp.read_text()) if stamp.exists() else {}
+    src = source_hash(ENGINE_SOURCES)
+    aot = gpu.get("arch") or "none"
+    if meta.get("backend") == "sycl" and (eng / EXE).exists() and meta.get("src") == src and meta.get("aot") == aot:
+        ok("engine already built for this PC")
+        return eng
+    root = oneapi_root()
+    if root is None:
+        fail("the Intel engine is compiled with oneAPI DPC++, which was not found (ONEAPI_ROOT or /opt/intel/oneapi)",
+             "install the Intel oneAPI Base Toolkit (DPC++ compiler and oneMKL) and the Level Zero GPU runtime: "
+             "docs/INTEL_SYCL.md")
+    if not shutil.which("git"):
+        fail("git is needed to compile the Intel engine", "Ubuntu/Debian: sudo apt install git")
+    os.environ.update(oneapi_env(root))
+    say("  Compiling the Strata engine for your Intel GPU "
+        f"({gpu['name']}{', AOT ' + aot if aot != 'none' else ', JIT image'}; 20-40 minutes, once) ...")
+    bdir = ROOT / "build-sycl-engine"
+    cmake_build(ROOT, bdir, "strata",
+                ["-DSTRATA_ENABLE_SYCL=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_ENABLE_HIP=OFF",
+                 "-DSTRATA_BUILD_TESTS=OFF", "-DCMAKE_C_COMPILER=icx", "-DCMAKE_CXX_COMPILER=icpx",
+                 f"-DSTRATA_SYCL_AOT_DEVICES={aot}", f"-DSTRATA_GGML_DIR={llama}"], None, "")
+    run([find_tool("cmake"), "--build", str(bdir), "--target", "strata-device"])   # the VRAM reading below
+    for f in [bdir / EXE, bdir / "strata-device", *sorted(bdir.glob("libstrata_sycl_*.so"))]:
+        shutil.copy2(f, eng / f.name)
+    lib_dirs = [str(root / "compiler" / "latest" / "lib"), str(root / "mkl" / "latest" / "lib")]
+    meta = {"source": "local-sycl", "backend": "sycl", "version": source_version(), "aot": aot, "vision": "none",
+            "lib_dirs": lib_dirs, "src": src}
+    stamp.write_text(json.dumps(meta, indent=1))
+    ok(f"engine compiled: {eng / EXE}")
+    return eng
+
+
+def sycl_card_vram(eng: Path, gpu: dict) -> dict:
+    """The card's VRAM as the compiled engine's runtime reports it (strata-device --list-devices), for the sizing."""
+    env = {**os.environ, **oneapi_env(oneapi_root() or Path("/opt/intel/oneapi")), **SYCL_ENV,
+           "ONEAPI_DEVICE_SELECTOR": f"level_zero:{gpu['index']}"}
+    try:
+        text = subprocess.run([str(eng / "strata-device"), "--list-devices"], capture_output=True, text=True, env=env,
+                              timeout=120).stdout
+        m = re.search(r"([0-9.]+) GiB", text)
+        if m:
+            return {**gpu, "vram_gb": float(m.group(1)) * 1.073741824}
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return gpu
+
+
 def hip_vision(asked) -> str:
     """The image encoder with the AMD backend (--vision): the CPU one when asked for (#304); a HIP (GPU) encoder build
     is a later step, so `yes`/`gpu` leave images off, as before, and say how to get them."""
@@ -1775,6 +1916,18 @@ def update_installed_engine(url_base) -> None:
                     raise RuntimeError("not published yet")
             except (Exception, SystemExit) as e:
                 warn(f"could not update the AMD engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
+                     "starting the installed one")
+        return
+    if meta.get("backend") == "sycl":                  # Intel: compiled here, again when its source changed
+        if meta.get("src") != source_hash(ENGINE_SOURCES):
+            try:
+                usable = [x for x in intel_gpus() if sycl_problem(x) is None]
+                g = next((x for x in usable if x.get("arch") == meta.get("aot")), usable[0] if usable else None)
+                if g is None:
+                    raise RuntimeError("no Intel GPU found")
+                build_engine_sycl({**g, "arch": meta.get("aot") if meta.get("aot") != "none" else ""}, get_llama_cpp())
+            except (Exception, SystemExit) as e:
+                warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
                      "starting the installed one")
         return
     if meta.get("backend") == "hip":                   # AMD: compiled here, again when its source changed
@@ -2983,7 +3136,7 @@ def main() -> int:
     ap.add_argument("--kv-streaming", choices=["auto", "on", "off"], default="auto",
                     help="from a 64K context: keep the KV cache in RAM and only the attention's window in VRAM (more "
                          "experts fit on the GPU); auto: when the RAM has room for it")
-    ap.add_argument("--backend", choices=["cuda", "hip"],
+    ap.add_argument("--backend", choices=["cuda", "hip", "sycl"],
                     help="cuda = NVIDIA (default), hip = AMD RX 7900 / 7800 / 7700 XT, RX 9060 XT / 9070 / AI PRO R9700 on "
                          "Linux or Windows (chosen by itself when the PC has no NVIDIA card Strata can use)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
@@ -3077,6 +3230,9 @@ def main() -> int:
     nv_ok = any(gpu_problem(g) is None for g in found)
     amd_ok = [g for g in amd if amd_problem(g) is None]
     hip = a.backend == "hip" or (a.backend is None and not nv_ok and bool(amd_ok))
+    intel = [] if hip or nv_ok and a.backend is None else intel_gpus()
+    sycl = a.backend == "sycl" or (a.backend is None and not nv_ok and not amd_ok and
+                                   any(sycl_problem(g) is None for g in intel))
     if a.backend is None and nv_ok and amd_ok:
         # both kinds of card: asked (a first run on such a PC used to take NVIDIA without mentioning the Radeon)
         say()
@@ -3089,7 +3245,27 @@ def main() -> int:
         hip = ask("Which cards?", ["1", "2"], "1", a.yes or a.check) == "2"
         if a.check and not hip:
             say(f"  (the AMD card: {'START-HERE.bat' if WIN else './setup.sh'} --backend hip)")
-    if hip:                                            # AMD: compiled here; Windows: ready-made
+    if sycl:                                           # Intel Arc: compiled here with oneAPI (docs/INTEL_SYCL.md)
+        if WIN:
+            fail("the Intel Arc backend is Linux-only for now", "docs/INTEL_SYCL.md")
+        if a.gpus:
+            fail("several Intel cards sharing one model (--gpus) is not supported yet", "use one card: --gpu N")
+        say("  Your Intel GPUs:" if intel else "  No Intel GPU found (sycl-ls lists no Level Zero GPU; the oneAPI "
+                                               "toolkit and the Level Zero runtime are needed: docs/INTEL_SYCL.md).")
+        for g in intel:
+            say(f"    GPU {g['index']}: {g['name']} ({g['arch_raw']}) - " + (sycl_problem(g) or "can be used"))
+        usable = [g for g in intel if sycl_problem(g) is None]
+        if not usable:
+            fail("no Intel GPU Strata can use", "the Intel backend runs on Arc A- and B-series cards (docs/INTEL_SYCL.md)")
+        if a.gpu is not None:
+            gpu = next((g for g in usable if g["index"] == a.gpu), None)
+            if gpu is None:
+                fail(f"Intel GPU {a.gpu} cannot be used", "use one of: " + ", ".join(f"--gpu {g['index']}" for g in usable))
+        else:
+            gpu = max(usable, key=lambda x: (round(x["vram_gb"]), -x["index"]))
+        chosen, sel, multi = [gpu], [gpu["index"]], []
+        ok(f"GPU: {gpu['name']}, ~{gpu['vram_gb']:.0f} GB VRAM, {gpu.get('arch') or 'JIT'} (Intel: docs/INTEL_SYCL.md)")
+    elif hip:                                          # AMD: compiled here; Windows: ready-made
         if WIN and a.gpus:
             fail("several AMD cards sharing one model (--gpus) is Linux-only for now", "use one card: --gpu N")
         say("  Your AMD GPUs:" if amd else "  No AMD GPU found (" + ("Windows lists no AMD display adapter)." if WIN
@@ -3424,7 +3600,14 @@ def main() -> int:
     step(4, "the Strata engine")
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
+    if sycl:                                           # Intel: compiled here; images have no SYCL encoder yet
+        if vision != "none":
+            warn("the Intel backend has no image encoder yet: images off")
+            vision = "none"
+        eng = build_engine_sycl(gpu, llama)
+        gpu = sycl_card_vram(eng, gpu)
+        ok(f"GPU memory as the engine sees it: {gpu['vram_gb']:.1f} GB")
+    elif hip and WIN:                                  # AMD on Windows: the ready-made HIP engine (no compiler)
         eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
         if eng is None:
             fail("no ready-made AMD engine for this Strata version" + (" (--build)" if a.build else ""),
@@ -3434,7 +3617,7 @@ def main() -> int:
         a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
     else:
         eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision)
-    if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
+    if eng is not None and not hip and not sycl and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
         pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
         if vision != "none" and not (eng / VEXE).exists():
             warn("the ready-made engine has no image encoder: compiling it")
@@ -3443,6 +3626,8 @@ def main() -> int:
             vision = prebuilt_vision(json.loads((eng / "BUILD.json").read_text()), gpu, vision)
     if eng is None:
         eng = build_engine_hip(gpu, llama, vision) if hip else build_engine(gpu, vision, a.yes, llama)
+    elif sycl:
+        pass
     meta = json.loads((eng / "BUILD.json").read_text())
     if hip and WIN:                                    # the ready-made engine's rocm/bin, first on the engine's PATH
         lib_dirs = [str(d) for d in hip_lib_dirs(eng)]
@@ -3551,6 +3736,14 @@ def main() -> int:
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
+    if sycl:   # Intel: the split window overlaps the CPU expert pool with the GPU (A770, MTP on: 7.44 vs 7.04 tok/s,
+        args += ["--spec-split"]   # mean of 4 and 3 runs; the pool is ~60% of a round there - docs/INTEL_SYCL.md)
+        # and on an SMT CPU one expert-pool worker more than the physical cores, the extras on SMT siblings: the pool is
+        # most of a round there (A770 + Ryzen 5 5600, 6 cores / 12 threads: 7 workers 15.62-15.73 tok/s against 14.71-14.79
+        # with the default 5; 11 workers ran slower, 13.35 - docs/INTEL_SYCL.md)
+        phys = physical_cores()
+        if phys and (os.cpu_count() or 0) >= 2 * phys:
+            args += ["--pool-workers", str(phys + 1), "--pool-affinity", "auto"]
     if scaling is not None:     # the resolved config: explicit flags as given, or the automatic yarn+factor
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
     if ctx > 8192:
@@ -3639,7 +3832,13 @@ def main() -> int:
             cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
         if resident:   # ROCm: large page-locked host allocations can fail or be slow for the CPU; keep the copy pageable
             cfg.setdefault("env", {})["STRATA_RESIDENT_PIN"] = "0"
-    if gpu["count"] > 1 or a.gpu is not None:
+    if sycl:
+        # the engine sees the one card the selector names (as its device 0); the oneAPI runtime libraries come from
+        # lib_dirs, the allocation / free-memory / FP64-emulation switches from env (tools/sycl/env.sh)
+        cfg["backend"] = "sycl"
+        cfg["sycl_device"] = gpu["index"]
+        cfg["env"] = {**SYCL_ENV, "ONEAPI_DEVICE_SELECTOR": f"level_zero:{gpu['index']}"}
+    elif gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
         cfg["gpus_asked"] = True                       # chosen at setup: not asked again at start
     if multi:                                          # a layer split across these cards (the server adds the flag)

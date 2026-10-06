@@ -314,7 +314,31 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
                          uint64_t shared_pack_hash) : capacity(bytes) {
     if (bytes == 0) return;
+#if defined(STRATA_USE_SYCL)
+    // SYCL has no cudaHostRegister (the shim refuses it): the pinned, device-mapped arena is one host USM
+    // allocation instead (docs/INTEL_SYCL.md).  A shared-file arena, or a failed allocation, takes the path below
+    // unpinned - its registration attempts fail and the working-set lock keeps it resident, as on CUDA.
+    std::string sycl_note;
+    if (shared_file.empty()) {
+        void* p = nullptr;
+        if (cudaHostAlloc(&p, (size_t) bytes, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess && p) {
+            base = p;
+            backing = PageBacking::PinnedBySycl;
+            registered_bytes = bytes;
+            note = "sycl::malloc_host (Level Zero host USM, device-mapped)";
+            if (max_pinned_bytes) note += "; the pin cap does not apply to a USM arena";
+            return;
+        }
+        (void) cudaGetLastError();
+        sycl_note = "sycl::malloc_host of " + std::to_string(bytes >> 20) + " MiB FAILED; ";
+    } else {
+        sycl_note = "a shared-file arena cannot be host USM; ";
+    }
+#endif
     base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+#if defined(STRATA_USE_SYCL)
+    note = sycl_note + note;
+#endif
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -409,6 +433,11 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
 }
 
 PinnedArena::~PinnedArena() {
+    if (base && backing == PageBacking::PinnedBySycl) {
+        cudaFreeHost(base);
+        base = nullptr;
+        return;
+    }
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {

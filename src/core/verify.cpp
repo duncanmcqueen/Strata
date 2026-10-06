@@ -11,6 +11,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -331,6 +332,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     cudaMemset(arena_, 0, count.used);
+    layer_ms_on_ = std::getenv("STRATA_VERIFY_LAYER_MS") != nullptr;
+    if (layer_ms_on_) layer_ms_.assign((size_t) (strata::kernels::kVerifyMaxT + 1) * 2 * 4, LayerMs{});
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
@@ -674,11 +677,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        // Any other expert count (the Coder's 256): the same batched GEMV, then the generic top-k over the n rows in
+        // one launch - each row is its own work-group there, so the bits are the per-token moe_route's.  Only when
+        // moe_route's GEMV is this one (native BF16 projections).  Per-token, a 4-token window spent 0.5 ms per
+        // layer here on an Arc A770 (8 launches).
+        const bool native_rt = native_router_enabled() && NE == 512 && K == 10;
+        if (dec_batch && n > 1 && w_router != nullptr && (native_rt || layer_native_bf16())) {
             try {
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
-                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                if (native_rt) native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                else router_top10(logits_ + tb * NE, n, (int) NE, (int) K, ids_ + tb * K, w_ + tb * K, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
@@ -890,6 +899,30 @@ std::string Verifier::profile_report() {
     return out;
 }
 
+std::string Verifier::layer_report() {
+    if (!layer_ms_on_) return std::string();
+    static const char* kinds[4] = {"GDN", "QSA", "first", "tail"};
+    std::string out;
+    char b[160];
+    for (int t = 1; t <= strata::kernels::kVerifyMaxT; ++t)
+        for (int G = 1; G <= 2; ++G) {
+            bool any = false;
+            for (int k = 0; k < 4; ++k) any |= layer_ms_[(size_t) ((t * 2 + (G - 1)) * 4 + k)].n > 0;
+            if (!any) continue;
+            std::snprintf(b, sizeof b, "\n  T=%d G=%d:", t, G);
+            out += b;
+            for (int k = 0; k < 4; ++k) {
+                LayerMs& m = layer_ms_[(size_t) ((t * 2 + (G - 1)) * 4 + k)];
+                if (m.n == 0) continue;
+                std::snprintf(b, sizeof b, "  %s gpu %.3f pool %.3f ms (x%lld)", kinds[k], m.gpu / (double) m.n,
+                              m.pool / (double) m.n, (long long) m.n);
+                out += b;
+                m = LayerMs{};
+            }
+        }
+    return out;
+}
+
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -1028,6 +1061,19 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    // SYCL (Level Zero): every window size is captured before the first window runs.  A window graph captured after
+    // the stream had replayed windows and commits never started when launched (measured on an Arc A770: the 3-token
+    // window captured after ~40 rounds; its first node never ran, the device was lost at the #267 timeout); every
+    // size captured up front, before any launch, ran.  The cause is not isolated; draining the queue before the
+    // capture did not help.  STRATA_VERIFY_CAPTURE_ALL=1 does the same on CUDA/HIP.
+#if defined(STRATA_USE_SYCL)
+    static const bool capture_all = true;
+#else
+    static const bool capture_all = std::getenv("STRATA_VERIFY_CAPTURE_ALL") != nullptr;
+#endif
+    if (capture_all)
+        for (int t = 1; t <= max_t_; ++t)
+            if (!capture(t, err)) return false;
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -1052,6 +1098,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err)) return false;
     }
     *(volatile uint32_t*) h_seq_ = 0;
+    for (int i = 1; i <= 8; ++i) ((volatile uint32_t*) h_seq_)[i] = 0;   // the payloads' ring tags (doorbell_payload_ready)
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
@@ -1071,6 +1118,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
+    Clock::time_point seg_start = Clock::now();   // STRATA_VERIFY_LAYER_MS: from the launch, then each flag
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int) (k % G);
@@ -1104,6 +1152,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
+        // the ring can arrive before its payload on some GPUs (elementwise.hpp): the pool reads it once it is whole
+        if (!strata::kernels::doorbell_wait_payload(h_seq_, h_x_ + (size_t) tb * g.n_embd, (int64_t) n * g.n_embd,
+                                                    h_ids_ + (size_t) tb * ss.k, h_w_ + (size_t) tb * ss.k,
+                                                    (int64_t) n * ss.k, want)) {
+            err = "verify: layer " + std::to_string(l) + " rang but its payload never arrived whole";
+            return false;
+        }
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -1124,6 +1179,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        if (layer_ms_on_) {
+            const int kind = k == 0 ? 2 : (is_qsa_layer(g, l) ? 1 : 0);
+            LayerMs& m = layer_ms_[(size_t) ((T * 2 + (G - 1)) * 4 + kind)];
+            m.gpu += std::chrono::duration<double, std::milli>(b - seg_start).count();
+            m.pool += ms_since(b);
+            ++m.n;
+            seg_start = Clock::now();
+        }
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
@@ -1133,6 +1196,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // beside the expert workers).
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (layer_ms_on_) {
+        LayerMs& m = layer_ms_[(size_t) ((T * 2 + (G - 1)) * 4 + 3)];
+        m.gpu += std::chrono::duration<double, std::milli>(Clock::now() - seg_start).count();
+        ++m.n;
+    }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps

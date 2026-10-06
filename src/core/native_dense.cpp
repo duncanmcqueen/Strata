@@ -6,10 +6,13 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <set>
+#include <string>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -26,7 +29,15 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
-struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
+struct DeviceFree {
+    void operator()(void* p) const {
+        if (!p) return;
+#if defined(STRATA_USE_SYCL)
+        strata::kernels::native_q6_k_unregister(p);   // a reordered Q6_K matrix (an upload that failed later)
+#endif
+        cudaFree(p);
+    }
+};
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
     WeightRef* ref;
@@ -65,7 +76,7 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 
 NativeDense::~NativeDense() {
     if (scratch_) cudaFree(scratch_);
-    for (void* p : weights_) cudaFree(p);
+    for (void* p : weights_) DeviceFree{}(p);
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -161,11 +172,29 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
+#if defined(STRATA_USE_SYCL)
+                // Q6_K in the reordered layout (native_mmvq.hpp), read by native_mmvq and the prompt path's
+                // dequantize; not the shared expert's matrices, whose kernels read the GGUF blocks.
+                // STRATA_SYCL_Q6K_GGUF=1 keeps every matrix in the GGUF layout.
+                static const bool keep_gguf = std::getenv("STRATA_SYCL_Q6K_GGUF") != nullptr;
+                const bool reorder = tensor.type == 14 && !keep_gguf && tensor.name.find("_shexp") == std::string::npos;
+                std::vector<uint8_t> reordered;
+                if (reorder) {
+                    reordered.resize(bytes);
+                    strata::kernels::native_q6_k_reorder(gguf.tensor_data(tensor), reordered.data(), bytes / 210);
+                }
+                const void* source = reorder ? (const void*) reordered.data() : gguf.tensor_data(tensor);
+#else
+                const void* source = gguf.tensor_data(tensor);
+#endif
                 if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                    status = cudaMemcpy(data.get(), source, bytes, cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
+#if defined(STRATA_USE_SYCL)
+                if (reorder) strata::kernels::native_q6_k_register_reordered(data.get(), bytes / 210);
+#endif
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
