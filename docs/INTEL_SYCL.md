@@ -144,8 +144,11 @@ What each step fixed:
 Repeated runs did not always print the same tokens (2 of 9 differed, diverging at token 6 or 29).  A diagnostic
 checksum showed why: the ring can become visible to the host before the last activation stores of the same
 kernel (14 of 2,832 rings in one run), despite the system-scope fences, so the CPU pool occasionally computed on a
-partly stale payload.  `doorbell_publish` now also writes, next to the sequence number, the exact checksum of the
-payload (the wrapping sum of the bit patterns of the activations, ids and weights) and the ring it belongs to.
+partly stale payload.  `doorbell_publish` now also writes, next to the sequence number, a checksum of the payload and
+the ring it belongs to.  The checksum sums every 32-bit word of the activations, ids and weights mixed with its
+position (murmur3's finalizer): the first version summed the plain bit patterns, which a reordering ([3, 7] -> [7, 3]
+in the ids) or cancelling changes passed (found in review).  It detects a stale payload - with a chance near 2^-32
+per read of missing one - it does not order the stores.
 The host waits until both match its view (`doorbell_wait_payload`, elementwise.hpp) before the pool reads, in the
 verify window and both token-graph loops.  The sequence word gets 64 bytes for this (layer.cpp's doorbell).  Five
 runs that diverged before, and three MTP runs, now print the same tokens; speed is unchanged.  CUDA/HIP keep
@@ -163,8 +166,10 @@ fixed four problems that only long prompts reached:
   (215,040 outputs), none below 4 GiB.  In the engine those columns read stale expert bytes, layer 0 came out
   non-finite, the router picked experts 0-9 for every token, and the reply was "!!!..." or a crash.  The BLAS shim
   now knows every device allocation (`device_offset_end`) and stages a GEMM's operands that lie past 4 GiB through a
-  96 MiB buffer of its own, in pieces of whole columns (`sycl_runtime/blas.cpp`; `sycl_gemm_4g` checks it bitwise
-  and fails with `STRATA_SYCL_GEMM_NO_STAGE=1`).  Borrowing then works as on CUDA/HIP: 8192-token chunks and the
+  buffer of the queue's own (96 MiB, grown when an operand needs more), in pieces of whole columns; a far transposed
+  B is staged whole.  A case it cannot stage is an error, never the unprotected GEMM (`sycl_runtime/blas.cpp`;
+  `sycl_gemm_4g` checks it bitwise, including a transposed B and C's interleaved halves, and fails with
+  `STRATA_SYCL_GEMM_NO_STAGE=1`).  Borrowing then works as on CUDA/HIP: 8192-token chunks and the
   full cache.  (`STRATA_SYCL_PREFILL_OWN=1` keeps own buffers instead, at most 2048-token chunks, the reservation
   below exact.)
 - **The own buffers' VRAM reservation** (the opt-in mode).  The expert cache's auto size reserved a linear estimate, which left
@@ -172,8 +177,10 @@ fixed four problems that only long prompts reached:
   reserves `Prefill::bytes_needed` exactly (6 of 6 long runs then completed).
 - **Cross-stream waits in the prompt path** were device-side barriers: the engine sat in a semaphore wait while
   experts streamed over the slow link (past the xe driver's 5 s job timeout: the engine was reset mid-prompt) or two
-  queues waited on each other (a deadlock).  Outside a capture `cudaStreamWaitEvent` now waits on the host (the
-  event's work is already submitted); captures keep the barrier.
+  queues waited on each other (a deadlock).  Outside a capture `cudaStreamWaitEvent` now waits on the host;
+  captures keep the barrier.  This narrows CUDA's contract: the call returns only once the event has completed, so it
+  must not be used where the event's work waits for something the caller does after the call (a spin wait on a
+  flag the host raises next would deadlock).  The engine never does that outside a capture.
 - **The doorbell check's slot.**  A split window publishes two rings before the host reads the first; the payload's
   tag and checksum are kept per ring (modulo 4), not in one slot.
 
@@ -195,7 +202,27 @@ same 128 tokens; two 8,572-token runs printed the same reply.
 
 The same search found a bug in the staging above: it copied C back in whole columns of ldc, so a GEMM writing m of
 ldc rows (the alpha and beta projections share one buffer, interleaved) wrote the scratch's stale rows over the
-other's outputs.  It copies C's m rows now (`sycl_gemm_4g` has the case, and fails with the old copy).
+other's outputs.  It copies C's m rows now.  `sycl_gemm_4g` has the case at a size that is staged (1024 x 128 outputs, the first
+half with beta = 0): with the old copy all 131,072 values of the other half are overwritten.  A review also found the
+staging advanced a transposed B by ldb per output column instead of by one row (a test now covers it, and fails with
+the old offset) and a shared scratch buffer across queues (now one per queue).
+
+**Runtime contract limits** (found in review, deliberately not changed): the legacy default stream orders only the
+synchronous copies and memsets against blocking streams, not asynchronous copies, kernels or graph launches, in either
+direction - the engine uses explicit streams; and `cudaStreamWaitEvent` waits on the host outside captures (above).
+Synchronization calls (`cudaStreamSynchronize`, `cudaDeviceSynchronize`, `cudaEventSynchronize`, the synchronous
+copies) now deliver the queues' asynchronous errors and return them.
+
+**Where a long prompt's time goes** (`STRATA_PREFILL_TIMING=1`, the 8,572-token prompt, a 6 GiB RAM budget): the
+GPU timeline is 74.5 s, and the phases charged most are the experts' down GEMMs (25-31 s), the gather (10-12 s) and
+the hc reads (6-9 s).  The GEMMs themselves are fast: the same F16 shapes alone take 12-80 µs (down: 2560 x n x 640,
+gate/up: 1280 x n x 2560, n 8-640), far from the ~1 ms each that the phase total implies.  The GPU is waiting for
+expert weights: 16,404 experts (21.6 GB) are streamed, 13,259 of them read from the model files because the 6 GiB RAM
+copy does not hold them, and the host side of that ("host staging") took 50-67 s.  The link is not the limit
+(page-locked or pageable host memory both upload at 1.84-1.91 GB/s; only one page-locked allocation of 4 GiB or more
+is refused, eight of 2 GiB are fine).  A larger RAM copy is the lever, but on this 31 GB PC setup's own resident
+sizing (15 GiB) plus an 8,192-token chunk ran out of memory (systemd-oomd killed the run at a 19 GB peak with 8 GB in
+swap); the long-prompt runs above use `--resident-budget-gib 6` for that reason.
 
 The xe driver kills a GPU job that runs longer than its job timeout (`job_timeout_ms`, 5000; at most 10000 via
 `/sys/class/drm/cardN/device/tile0/gt0/engines/ccs/job_timeout_ms`, as root).  A verify window is one job whose spin

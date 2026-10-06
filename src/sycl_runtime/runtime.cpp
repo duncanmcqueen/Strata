@@ -138,7 +138,7 @@ void wait_blocking_streams(int device) {
         streams = registry().blocking_streams;
     }
     for (strata_cuda_stream* s : streams)
-        if (s->device == device && !s->capturing) s->queue.wait();
+        if (s->device == device && !s->capturing) s->queue.wait_and_throw();
 }
 
 int current_device() { return g_current_device; }
@@ -173,6 +173,14 @@ cudaError_t from_exception(const sycl::exception& e) {
 void note_async_error(const char* what) {
     std::fprintf(stderr, "strata sycl: %s\n", what);
     g_async_error.store(static_cast<int>(cudaErrorUnknown), std::memory_order_release);
+}
+
+// A synchronization point's result: the asynchronous errors a wait delivered (wait_and_throw runs the queue's
+// async_handler, which records them here) are this call's error too, as CUDA's synchronize returns a failed kernel's
+// error.  The slot stays set (sticky) for cudaGetLastError, which clears it.
+cudaError_t sync_result() {
+    const int e = g_async_error.load(std::memory_order_acquire);
+    return e != 0 ? fail(static_cast<cudaError_t>(e)) : set_last_error(cudaSuccess);
 }
 
 // The public bridge (include/strata/sycl_runtime/queue_bridge.hpp).
@@ -570,8 +578,8 @@ cudaError_t cudaDeviceSynchronize() {
             std::lock_guard<std::mutex> lock(strata::sycl_runtime::queues_mutex());
             queues = registry().queues;
         }
-        for (sycl::queue* q : queues) q->wait();
-        return set_last_error(cudaSuccess);
+        for (sycl::queue* q : queues) q->wait_and_throw();
+        return strata::sycl_runtime::sync_result();
     } catch (const sycl::exception& e) {
         return from_exception(e);
     }
@@ -641,8 +649,8 @@ cudaError_t cudaStreamDestroy(cudaStream_t stream) {
 
 cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
     try {
-        stream_or_default(stream)->queue.wait();
-        return set_last_error(cudaSuccess);
+        stream_or_default(stream)->queue.wait_and_throw();
+        return strata::sycl_runtime::sync_result();
     } catch (const sycl::exception& e) {
         return from_exception(e);
     }
@@ -663,8 +671,10 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned
         // Outside a capture, the host waits instead of the GPU.  A device-side barrier on an event of another queue
         // is a semaphore wait on the engine: while the prompt path streams experts over a slow link it held the
         // compute engine for longer than the xe driver's 5 s job timeout (the engine was reset mid-prompt and the
-        // reply came out as garbage), and two queues waiting on each other this way deadlocked.  The event's work is
-        // already submitted, so a host wait cannot deadlock; the queue's own order covers the rest.
+        // reply came out as garbage), and two queues waiting on each other this way deadlocked.  A narrower contract
+        // than CUDA's: this returns once the event has completed, so a caller must not depend on doing something after
+        // this call for the event's work to finish (a spin wait on a flag it raises next would deadlock here).  The
+        // engine never does that outside a capture; captures keep the device-side barrier.
         static const bool device_waits = std::getenv("STRATA_SYCL_DEVICE_EVENT_WAITS") != nullptr;
         if (!s->capturing && !device_waits) {
             if (event->event.get_info<sycl::info::event::command_execution_status>() !=
@@ -730,8 +740,8 @@ cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
 cudaError_t cudaEventSynchronize(cudaEvent_t event) {
     if (!event || !event->recorded) return set_last_error(cudaSuccess);
     try {
-        event->event.wait();
-        return set_last_error(cudaSuccess);
+        event->event.wait_and_throw();
+        return strata::sycl_runtime::sync_result();
     } catch (const sycl::exception& e) {
         return from_exception(e);
     }

@@ -1,20 +1,21 @@
 # Intel Arc SYCL port: agent handoff
 
-Updated 2026-10-05: every kernel is ported, the engine runs the Coder model end to end on the A770 (15 tok/s decode
-with setup's configuration, 11 tok/s at 8.5K context), and setup supports `--backend sycl`.  Measurements and the speed history are in
+Updated 2026-10-06: every kernel is ported, the engine runs the Coder model end to end on the A770 (15.8-16.3 tok/s
+decode with setup's configuration and its draft vocabulary, 11-12 tok/s at 8.5K context), and setup supports `--backend sycl`.  Measurements and the speed history are in
 [INTEL_SYCL.md](INTEL_SYCL.md#model-run-and-speed); the sections below the next-steps list are the earlier batches'
 record.
 
-## Objective and current checkpoint
+## Objective and checkpoint (historical: the batches as they were planned)
 
-Continue the Intel Arc SYCL backend port of Strata. The user has repeatedly authorized continuing the implementation and tests. This handoff records the work completed through the QSA prompt-attention port; the next implementation batch is Batch 3.
+Batches 1-3, engine integration and the speed work are done (see the top of this file and the next-steps list); the list
+below is the record of how the port was staged, kept for its notes.
 
 - Batch 1: complete; runtime/backend foundation and initial kernel family ports.
 - Batch 2: complete; GDN, GR, QSA core and grouped 2-bit experts.
 - Batch 2b: complete for correctness; QSA decode/prompt attention, selection and KV streaming, plus their INT8/Q4 storage dependencies.
-- Batch 3: in progress. Done: i-quant kernels (`iq_kernels.cpp`) and native MMVQ (`native_mmvq.cpp`). Pending: PLE, remaining native kernels and verification.
-- Engine integration: pending. This is a tested kernel backend, not yet a working Intel inference engine.
-- Matrix acceleration and performance/model-quality validation: pending, separate from correctness parity.
+- Batch 3: complete; i-quant kernels, native MMVQ, PLE and the remaining native kernels.
+- Engine integration: complete; the Coder model runs end to end on the A770.
+- Performance: see INTEL_SYCL.md ("Model run and speed"); matrix (XMX) acceleration of the engine's own kernels is not done.
 
 ## Workspace and instructions
 

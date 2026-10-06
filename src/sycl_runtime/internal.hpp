@@ -81,6 +81,8 @@ void unregister_blocking_stream(strata_cuda_stream* s);
 // refuses that implicit synchronization during capture, and waiting on a recording queue has nothing to wait for).
 // Work submitted later is ordered after the synchronous call because the call returns only once it completes.
 void wait_blocking_streams(int device);
+// a synchronization point's result: the recorded asynchronous error, else success (runtime.cpp)
+cudaError_t sync_result();
 
 int current_device();                                    // the thread's cudaSetDevice choice
 cudaError_t set_current_device(int device);

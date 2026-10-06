@@ -143,8 +143,8 @@ cudaError_t cudaMemcpy(void* dst, const void* src, size_t bytes, cudaMemcpyKind 
         // device's blocking streams and in the default stream, and returns when it completes.
         strata_cuda_stream* d = stream_or_default(nullptr);
         strata::sycl_runtime::wait_blocking_streams(d->device);
-        d->queue.memcpy(dst, src, bytes).wait();
-        return set_last_error(cudaSuccess);
+        d->queue.memcpy(dst, src, bytes).wait_and_throw();
+        return strata::sycl_runtime::sync_result();
     } catch (const sycl::exception& e) {
         return from_exception(e);
     }
@@ -189,8 +189,8 @@ cudaError_t cudaMemset(void* pointer, int value, size_t bytes) {
     try {
         strata_cuda_stream* d = stream_or_default(nullptr);
         strata::sycl_runtime::wait_blocking_streams(d->device);  // the legacy default stream, as cudaMemcpy
-        d->queue.memset(pointer, value, bytes).wait();
-        return set_last_error(cudaSuccess);
+        d->queue.memset(pointer, value, bytes).wait_and_throw();
+        return strata::sycl_runtime::sync_result();
     } catch (const sycl::exception& e) {
         return from_exception(e);
     }

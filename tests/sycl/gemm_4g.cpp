@@ -70,7 +70,8 @@ int main() {
             fails += !ok;
         }
     // two GEMMs of half the rows into one C interleaved by ldc = 2m past 4 GiB (the prompt path's alpha and beta
-    // projections): each writes its m rows only, and the pair gives the full GEMM's outputs
+    // projections): each writes its m rows only, and the pair gives the full GEMM's outputs.  (This size runs the
+    // shim's own small-output kernel, which needs no staging; the staged case follows.)
     {
         const int M = 48, TT = 3;
         const size_t cb = (size_t) TT * 2 * M * 4;
@@ -112,6 +113,81 @@ int main() {
                     close ? "ok" : "TOO LARGE");
         fails += !close;
         cudaFree(y2);
+    }
+    // the same interleaving at a size oneMKL computes (m x n above the shim's own kernel's 65,536 outputs), so the C
+    // past 4 GiB is staged: the first half with beta = 0 (nothing copied in - the case a whole-column copy back
+    // corrupted), then the second with beta = 1.  The untouched half must keep its sentinel, and every value must be
+    // the same call's on an ordinary buffer.
+    {
+        const int M = 1024, TT = 128, LDC = 2 * M;
+        const size_t cb = (size_t) TT * LDC * 4;
+        std::vector<float> sentinel((size_t) TT * LDC, -7.0f), far_c(sentinel.size()), near_c(sentinel.size());
+        float* yf = (float*) (arena + big - cb - 4096);
+        float* yn = nullptr;
+        cudaMalloc((void**) &yn, cb);
+        auto half = [&](float* y, int r0, float beta) {
+            return cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, M, TT, K, &one, dW + (size_t) r0 * K, CUDA_R_16BF, K, dX,
+                                CUDA_R_16BF, K, &beta, y + r0, CUDA_R_32F, LDC, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        };
+        cudaMemcpy(yf, sentinel.data(), cb, cudaMemcpyHostToDevice);
+        cudaMemcpy(yn, sentinel.data(), cb, cudaMemcpyHostToDevice);
+        half(yf, 0, zero);
+        half(yn, 0, zero);
+        cudaStreamSynchronize(st);
+        cudaMemcpy(far_c.data(), yf, cb, cudaMemcpyDeviceToHost);
+        size_t touched = 0;
+        for (int t = 0; t < TT; ++t)
+            for (int r = M; r < LDC; ++r) touched += far_c[(size_t) t * LDC + r] != -7.0f;
+        half(yf, M, one);
+        half(yn, M, one);
+        cudaStreamSynchronize(st);
+        cudaMemcpy(far_c.data(), yf, cb, cudaMemcpyDeviceToHost);
+        cudaMemcpy(near_c.data(), yn, cb, cudaMemcpyDeviceToHost);
+        const bool ok = touched == 0 && std::memcmp(far_c.data(), near_c.data(), cb) == 0;
+        std::printf("gemm_4g: two staged interleaved halves of C (ldc = 2m, %d x %d) past 4 GiB: %zu rows of the other "
+                    "half overwritten, %s\n", M, TT, touched, ok ? "bitwise equal" : "DIFFERS");
+        fails += !ok;
+        cudaFree(yn);
+    }
+    // a transposed B (stored n x k): with C past 4 GiB in several staging pieces (1024 x 32768 outputs, 128 MiB of
+    // C), each piece's B starts c0 rows into the stored matrix, not c0 * ldb; with B itself past 4 GiB it is staged
+    // whole.  Both against the same call on ordinary buffers.
+    {
+        const int M = 1024, NN = 32768;
+        std::vector<uint16_t> Bt((size_t) NN * K);
+        for (auto& v : Bt) v = (uint16_t) (0x3c00 + (rng() & 0x3ff)) ^ (uint16_t) ((rng() & 1) << 15);
+        const size_t bb = Bt.size() * 2, cb = (size_t) NN * M * 4;
+        uint16_t* bn = nullptr;
+        float* cn = nullptr;
+        cudaMalloc((void**) &bn, bb);
+        cudaMalloc((void**) &cn, cb);
+        cudaMemcpy(bn, Bt.data(), bb, cudaMemcpyHostToDevice);
+        auto gemm_t = [&](const uint16_t* b, float* c) {
+            return cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_T, M, NN, K, &one, dW, CUDA_R_16BF, K, b, CUDA_R_16BF, NN, &zero,
+                                c, CUDA_R_32F, M, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        };
+        std::vector<float> ref((size_t) NN * M), got(ref.size());
+        gemm_t(bn, cn);
+        cudaStreamSynchronize(st);
+        cudaMemcpy(ref.data(), cn, cb, cudaMemcpyDeviceToHost);
+        for (int which = 0; which < 2; ++which) {   // 0: C past 4 GiB, 1: B past 4 GiB
+            uint16_t* b = bn;
+            float* c = cn;
+            if (which == 0) c = (float*) (arena + big - cb - 4096);
+            else {
+                b = (uint16_t*) (arena + big - bb - 4096);
+                cudaMemcpy(b, Bt.data(), bb, cudaMemcpyHostToDevice);
+            }
+            cudaMemset(c, 0, cb);
+            gemm_t(b, c);
+            cudaStreamSynchronize(st);
+            cudaMemcpy(got.data(), c, cb, cudaMemcpyDeviceToHost);
+            const bool ok = std::memcmp(got.data(), ref.data(), cb) == 0;
+            std::printf("gemm_4g: transposed B, %s past 4 GiB: %s\n", which ? "B" : "C", ok ? "bitwise equal" : "DIFFERS");
+            fails += !ok;
+        }
+        cudaFree(bn);
+        cudaFree(cn);
     }
     std::printf("gemm_4g: %d failures\n", fails);
     return fails ? 1 : 0;

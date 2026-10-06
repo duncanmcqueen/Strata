@@ -7,6 +7,8 @@
 // combinations are the two gemm.cu actually launches - bf16 x bf16 -> f32 and
 // f16 x f16 -> f32, both with CUBLAS_COMPUTE_32F; anything else is NOT_SUPPORTED.
 #include <algorithm>
+#include <mutex>
+#include <map>
 #include <cstdlib>
 #include "../sycl_runtime/internal.hpp"
 
@@ -40,6 +42,25 @@ oneapi::mkl::transpose convert(cublasOperation_t op) {
         case CUBLAS_OP_T: return oneapi::mkl::transpose::trans;
         default: return oneapi::mkl::transpose::conjtrans;
     }
+}
+
+// The GEMM staging buffer of one queue (below), at least `bytes`; nullptr when it cannot be allocated.  Growing it
+// first waits for the queue: its earlier GEMMs may still read the old buffer.  A buffer lives as long as the process.
+uint8_t* queue_scratch(sycl::queue& q, size_t bytes) {
+    struct Scratch { uint8_t* p = nullptr; size_t bytes = 0; };
+    static std::mutex mu;
+    static std::map<const sycl::queue*, Scratch> by_queue;
+    const std::lock_guard<std::mutex> lock(mu);
+    Scratch& s = by_queue[&q];
+    if (s.bytes >= bytes) return s.p;
+    if (s.p != nullptr) {
+        q.wait();
+        sycl::free(s.p, q);
+        s = Scratch{};
+    }
+    s.p = static_cast<uint8_t*>(sycl::malloc_device(bytes, q));
+    s.bytes = s.p != nullptr ? bytes : 0;
+    return s.p;
 }
 
 // C = alpha A^T B + beta C for a small output (m x n <= kSmallMN), A and B 16-bit (BF16 or F16), C FP32: one 16-wide
@@ -243,8 +264,8 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cub
         // allocation (measured on an Arc A770, oneMKL 2026.1: a 1,845-column BF16 B placed past 4 GiB of a 10.5 GiB
         // allocation gave 215,040 wrong outputs - exactly its last 21 columns - and none below 4 GiB).  The prompt path
         // borrows the top of the ~10 GiB expert cache for its buffers, so its GEMMs met this and the prompt came out
-        // non-finite.  Operands past 4 GiB go through a 96 MiB buffer of the shim's own: A copied in whole when it is
-        // there, B (and C's m rows, copied back; copied in first for a nonzero beta) in pieces of whole columns, one GEMM
+        // non-finite.  Operands past 4 GiB go through a buffer of the queue's own (96 MiB, more when needed): A copied
+        // in whole when it is there, B (and C's m rows, copied back; copied in first for a nonzero beta) in pieces of whole columns, one GEMM
         // per piece - every output element is still one dot product over k.
         const size_t es = Atype == CUDA_R_32F ? 4 : 2;
         const size_t a_bytes = (size_t) lda * (size_t) (transa == CUBLAS_OP_N ? k : m) * es;
@@ -259,30 +280,37 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cub
             if (!run(A, B, n, C)) return blas_fail(CUBLAS_STATUS_NOT_SUPPORTED);
             return CUBLAS_STATUS_SUCCESS;
         }
-        static uint8_t* scratch = nullptr;
-        if (scratch == nullptr) scratch = static_cast<uint8_t*>(sycl::malloc_device(kScratch, q));
+        // The staging buffer is the queue's own (a GEMM on another stream must not overwrite it while this one
+        // reads it), grown when an operand needs more: A whole when it is far, B whole when it is far and
+        // transposed (its columns of op(B) are rows of the stored matrix), and at least one column of B and C.
+        const bool b_whole = far_b && transb != CUBLAS_OP_N;
         const size_t a_room = far_a ? (a_bytes + 255) & ~(size_t) 255 : 0;
-        const size_t per_col = (far_b ? b_col : 0) + (far_c ? c_col : 0);
-        if (scratch == nullptr || a_room >= kScratch || (far_b && transb != CUBLAS_OP_N) ||
-            (per_col > 0 && kScratch - a_room < per_col)) {
-            if (!run(A, B, n, C)) return blas_fail(CUBLAS_STATUS_NOT_SUPPORTED);   // nothing better to do
-            return CUBLAS_STATUS_SUCCESS;
-        }
+        const size_t bw_room = b_whole ? (b_cols * b_col + 255) & ~(size_t) 255 : 0;
+        const size_t per_col = (far_b && !b_whole ? b_col : 0) + (far_c ? c_col : 0);
+        uint8_t* scratch = queue_scratch(q, std::max(kScratch, a_room + bw_room + per_col));
+        if (scratch == nullptr) return blas_fail(CUBLAS_STATUS_ALLOC_FAILED);   // never the unprotected GEMM
+        const size_t room = std::max(kScratch, a_room + bw_room + per_col);
         if (far_a) q.memcpy(scratch, A, a_bytes);
+        if (b_whole) q.memcpy(scratch + a_room, B, b_cols * b_col);
         const void* Ause = far_a ? (const void*) scratch : A;
-        const int per = per_col ? (int) std::min<size_t>((size_t) n, (kScratch - a_room) / per_col) : n;
+        const uint8_t* Bbase = b_whole ? scratch + a_room : static_cast<const uint8_t*>(B);
+        // a piece of output columns [c0, c0 + nc): op(B)'s columns c0.. start c0 * ldb elements in for an untransposed
+        // B, c0 elements in for a transposed one
+        const size_t b_step = transb == CUBLAS_OP_N ? b_col : es;
+        const size_t left = room - a_room - bw_room;
+        const int per = per_col ? (int) std::min<size_t>((size_t) n, left / per_col) : n;
         for (int c0 = 0; c0 < n; c0 += per) {
             const int nc = std::min(per, n - c0);
-            uint8_t* sb = scratch + a_room;
-            uint8_t* sc = sb + (far_b ? (size_t) nc * b_col : 0);
-            const void* Bp = static_cast<const uint8_t*>(B) + (size_t) c0 * b_col;
+            uint8_t* sb = scratch + a_room + bw_room;
+            uint8_t* sc = sb + (far_b && !b_whole ? (size_t) nc * b_col : 0);
+            const uint8_t* Bp = Bbase + (size_t) c0 * b_step;
             void* Cp = static_cast<uint8_t*>(C) + (size_t) c0 * c_col;
-            if (far_b) q.memcpy(sb, Bp, (size_t) nc * b_col);
+            if (far_b && !b_whole) q.memcpy(sb, Bp, (size_t) nc * b_col);
             // C's m rows of each column only: ldc > m leaves rows that are not this GEMM's (the prompt path's alpha
             // and beta projections share one buffer, interleaved by ldc), and a whole-column copy back wrote the
             // scratch's stale rows over the other projection's outputs
             if (far_c && b != 0.0f) q.ext_oneapi_memcpy2d(sc, c_col, Cp, c_col, (size_t) m * sizeof(float), (size_t) nc);
-            if (!run(Ause, far_b ? (const void*) sb : Bp, nc, far_c ? (void*) sc : Cp))
+            if (!run(Ause, far_b && !b_whole ? (const void*) sb : (const void*) Bp, nc, far_c ? (void*) sc : Cp))
                 return blas_fail(CUBLAS_STATUS_NOT_SUPPORTED);
             if (far_c) q.ext_oneapi_memcpy2d(Cp, c_col, sc, c_col, (size_t) m * sizeof(float), (size_t) nc);
         }

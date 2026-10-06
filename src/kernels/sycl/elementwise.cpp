@@ -260,11 +260,25 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
 }
 
 namespace {
+// The payload's checksum: the wrapping sum of every 32-bit word mixed with its position (murmur3's finalizer).  A plain
+// sum of the words missed a reordering ([3, 7] -> [7, 3] in the expert ids) and cancelling changes; mixed, a stale
+// payload passes only with a chance near 2^-32 per read.  It detects; it does not order - the host keeps reading
+// until the payload it sees matches.  Positions: x 0..n-1, ids n..n+k-1, weights n+k..n+2k-1.
+inline uint32_t payload_mix(uint32_t word, uint32_t pos) {
+    uint32_t h = word ^ (pos * 0x9E3779B9u);
+    h ^= h >> 16;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return h;
+}
 inline uint32_t payload_sum(const float* x, int64_t n, const int32_t* ids, const float* weights, int64_t k) {
     uint32_t s = 0;
-    for (int64_t j = 0; j < n; ++j) s += sycl::bit_cast<uint32_t>(((const volatile float*) x)[j]);
-    for (int64_t j = 0; j < k; ++j) s += (uint32_t) ((const volatile int32_t*) ids)[j];
-    for (int64_t j = 0; j < k; ++j) s += sycl::bit_cast<uint32_t>(((const volatile float*) weights)[j]);
+    for (int64_t j = 0; j < n; ++j) s += payload_mix(sycl::bit_cast<uint32_t>(((const volatile float*) x)[j]), (uint32_t) j);
+    for (int64_t j = 0; j < k; ++j) s += payload_mix((uint32_t) ((const volatile int32_t*) ids)[j], (uint32_t) (n + j));
+    for (int64_t j = 0; j < k; ++j)
+        s += payload_mix(sycl::bit_cast<uint32_t>(((const volatile float*) weights)[j]), (uint32_t) (n + k + j));
     return s;
 }
 }  // namespace
@@ -312,13 +326,13 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
             for (int j = i; j < (int) n / 2; j += 1024) {
                 const uint64_t v = ((const uint64_t*) x)[j];
                 sycl_mapped::store((uint64_t*) x_out, v, (size_t) j);
-                part += (uint32_t) v + (uint32_t) (v >> 32);
+                part += payload_mix((uint32_t) v, (uint32_t) (2 * j)) + payload_mix((uint32_t) (v >> 32), (uint32_t) (2 * j + 1));
             }
         } else {
             for (int j = i; j < (int) n; j += 1024) {
                 const float v = x[j];
                 sycl_mapped::store(x_out, v, (size_t) j);
-                part += sycl::bit_cast<uint32_t>(v);
+                part += payload_mix(sycl::bit_cast<uint32_t>(v), (uint32_t) j);
             }
         }
         if (i < (int) k) {
@@ -326,7 +340,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
             const float wv = weights[i];
             sycl_mapped::store(ids_out, id, (size_t) i);
             sycl_mapped::store(weights_out, wv, (size_t) i);
-            part += (uint32_t) id + sycl::bit_cast<uint32_t>(wv);
+            part += payload_mix((uint32_t) id, (uint32_t) (n + i)) + payload_mix(sycl::bit_cast<uint32_t>(wv), (uint32_t) (n + k + i));
         }
         const uint32_t sum = sycl::reduce_over_group(it.get_group(), part, sycl::plus<uint32_t>());
         sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
