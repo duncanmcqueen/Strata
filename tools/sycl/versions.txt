@@ -13,12 +13,23 @@ oneAPI Unified Runtime 1.17.39758 (over Level-Zero V2, per sycl-ls)
 Intel compute runtime  26.35.39758.10-1.1 (OpenCL NEO 26.35.39758, ocloc 26.35.39758)
 Level Zero loader      1.32.0-1
 
-# Cards in the test machine (sycl-ls, level_zero backend):
+# Cards in the dev machine (sycl-ls, level_zero backend):
 #   level_zero:0  Arc B580  (Battlemage G21, 12 GB) - display card, keep out of test runs
 #   level_zero:1  Arc A770  (Alchemist DG2, 16 GB)  - the inference/test card
 #
 # Pin the inference card for every run:  ONEAPI_DEVICE_SELECTOR=level_zero:1
 # AOT device names: dg2-g10 (A770, alias acm-g10), bmg-g21 (B580).
+#
+# Second dev machine (guilfoyle, 2026-10-06), Arc Pro B70 over OcuLink:
+#   level_zero:0  Arc Pro B70 (Battlemage G31, 32 GiB) - the inference/test card
+#   level_zero:1  integrated Arc Graphics (Meteor Lake) - keep out of test runs
+#   AOT device name: bmg-g31; PCIe probe 6.9 GB/s host->device (vs 1.9 on the A770's
+#   chipset x4 slot).  Built and ran the Coder IQ1_M end to end: decode 30.7-35.6 tok/s,
+#   prefill 383-395 tok/s (all experts in VRAM).  See docs/INTEL_SYCL.md.
+#   tools/sycl/env.sh now selects the discrete Arc by name (exactly one -> it; several ->
+#   the historical level_zero:1), so the B70 box works without an explicit selector.
+#   Known issue fixed 2026-10-06: sycl_engine_kernels segfaulted in the gpu_stamp host-clock
+#   thread on Battlemage (src/kernels/sycl/gpu_stamp.cpp now stops and joins it).
 # A770 sub-group sizes: 8, 16, 32 - the backend requires 32 (checked at device enumeration).
 #
 # Required run-time environment (tools/sycl/env.sh sets these):
