@@ -514,6 +514,30 @@ Raise the locked-memory limit as the CUDA build expects.
   (16 accumulators + 4 code words in flight) — correct, but a known
   performance item for when benchmarking starts.
 
+## Arc Pro B70 (Battlemage)
+
+The second card, on another PC (2026-10-06): an Arc Pro B70 (Battlemage G31, 32 GiB, `xe` driver) over OcuLink, with
+a Core Ultra 5 125H (Meteor Lake: 4 performance cores, AVX2).  The same branch built for it with
+`-DSTRATA_SYCL_AOT_DEVICES=bmg-g31`; `tools/sycl/env.sh` now picks the discrete Arc by name (the B70 is `level_zero:0`
+there, the integrated Arc `level_zero:1`), and the engine's PCIe probe measured 6.9 GB/s host to device (1.9 on the
+A770's chipset slot).  One Battlemage-only failure came up: `sycl_engine_kernels` crashed in the profiler's host-clock
+thread (`gpu_stamp.cpp`), which is now stopped and joined.
+
+The Coder model (IQ1_M, setup's resident mode, MTP draft layer) at the model's full 256K context
+(`--max-context 262144 --kv int8`):
+
+| Metric | B70 |
+| --- | --- |
+| Prompt | 260,999 tokens in 681 s: 383.2 tok/s, 11.4 min to the first token (383-395 tok/s in other runs) |
+| Decode, every draft accepted | 37.69 tok/s (64 tokens; 55 of 55 drafts, 5.58 tokens per round) |
+| Decode, natural text | ~23-30 tok/s (draft acceptance ~0.73-0.81); 30.7-35.6 tok/s in shorter runs |
+| Experts | 11,547 in VRAM, 5.07 GiB in RAM, no disk reads |
+| Verify window | 98.6 ms waiting for the GPU, 12.7 ms CPU pool, per round |
+
+Against the A770 (~16 tok/s, 106-130 tok/s prompts at 8.5K): the 32 GiB card holds most experts, so the CPU pool drops
+from ~115 to ~13 ms per round and the GPU becomes the whole round; the faster link and the larger cache together make
+the prompt about 3x as fast at 30x the length.
+
 ## Build
 
 ```sh

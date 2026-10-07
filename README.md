@@ -7,16 +7,10 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 
 > **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) that adds support for Intel Arc GPUs.**
 > It adds a third GPU backend built with Intel's oneAPI (SYCL on Level Zero) next to the original NVIDIA (CUDA) and
-> AMD (HIP) ones. It runs the Coder model end to end on both Intel generations:
->
-> | Card | Writes answers | Reads your prompt |
-> | --- | ---: | ---: |
-> | Arc Pro B70 (Battlemage, 32 GB, OcuLink), Core Ultra 5 125H | 30.7-35.6 tokens/s | 383-395 tokens/s |
-> | Arc A770 (Alchemist, 16 GB, PCIe 3.0 x4), Ryzen 5 5600 | ~16 tokens/s | 106-130 tokens/s |
->
-> The B70 holds every expert in VRAM; the A770 shares them with the CPU. The build,
-> every measurement and the known limits are in [docs/INTEL_SYCL.md](docs/INTEL_SYCL.md); the rest of this README is
-> the upstream project's and describes the NVIDIA and AMD builds. Not affiliated with or endorsed by Intel.
+> AMD (HIP) ones, tested on Linux on an Arc A770 (Alchemist) and an Arc Pro B70 (Battlemage): see the Intel row in
+> [How fast is it?](#how-fast-is-it). The build,
+> every measurement and the known limits are in [docs/INTEL_SYCL.md](docs/INTEL_SYCL.md); apart from the Intel rows, the rest
+> of this README is the upstream project's and describes the NVIDIA and AMD builds. Not affiliated with or endorsed by Intel.
 
 <p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
@@ -28,8 +22,9 @@ agents, and nothing leaves your PC.
 
 ## How fast is it?
 
-Measured on two ordinary gaming PCs. "Writes answers" is how fast the reply appears in a short chat; "reads your
-prompt" is how fast it takes in what you send (a 32K-token document, code or chat history). A token is about ¾ of a
+Measured on two ordinary gaming PCs, and in this fork on two Intel Arc PCs. "Writes answers" is how fast the reply
+appears in a short chat; "reads your prompt" is how fast it takes in what you send (a 32K-token document, code or chat
+history; the Intel rows' prompt lengths are below). A token is about ¾ of a
 word, so 60 tokens per second is faster than you can read.
 
 <table>
@@ -53,7 +48,27 @@ word, so 60 tokens per second is faster than you can read.
 | **Coder** | 44 tokens/s | 1,420 tokens/s |
 
 </td></tr>
+<tr><th>Intel: Arc Pro B70 (32 GB, OcuLink), Core Ultra 5 125H</th><th>Intel: Arc A770 (16 GB, PCIe 3.0 x4), Ryzen 5 5600, 31 GB RAM</th></tr>
+<tr><td>
+
+| Size | Writes answers | Reads your prompt |
+| --- | ---: | ---: |
+| **Coder** | 23-30 tokens/s | 383 tokens/s |
+
+</td><td>
+
+| Size | Writes answers | Reads your prompt |
+| --- | ---: | ---: |
+| **Coder** | 16 tokens/s | 106-130 tokens/s |
+
+</td></tr>
 </table>
+
+Intel rows (Linux, this fork's SYCL backend, the Coder model's IQ1_M pack with its MTP draft layer): the B70 read a
+260,999-token prompt (256K context, `--kv int8`: 11.4 minutes to the first token) and wrote natural text at 23-30
+tokens/s (37.7 when every draft is accepted); 11,547 experts sit in its VRAM and 5 GB in RAM.  The A770 read an
+8,572-token prompt (16K context); with 16 GB of VRAM, most of the experts a reply needs run on the CPU, and its slot
+is PCIe 3.0 x4.  Details: [docs/INTEL_SYCL.md](docs/INTEL_SYCL.md).
 
 A card with more VRAM is faster: an RTX 3090 (24 GB) should write roughly 100-140 tokens per second. Long chats,
 other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size), [community results](docs/COMMUNITY_BENCHMARKS.md).
