@@ -3736,6 +3736,13 @@ def main() -> int:
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
+    if sycl:
+        # Intel: the prompt path is dequantize + oneMKL GEMM and re-streams expert blobs per chunk, so a larger
+        # chunk is measurably faster; auto:32768 lets the engine take the largest chunk the expert cache can lend
+        # and fall back to smaller ones when it cannot (plan_lend), so smaller-VRAM cards are unaffected.  B70,
+        # 32,903-token prompt: 438 tok/s at the default 8192 chunk, 489 at 16384 and 516 at 32768 (docs/INTEL_SYCL.md).
+        if "--prefill" in args:
+            args[args.index("--prefill") + 1] = "auto:32768"
     if sycl:   # Intel: the split window overlaps the CPU expert pool with the GPU (A770, MTP on: 7.44 vs 7.04 tok/s,
         args += ["--spec-split"]   # mean of 4 and 3 runs; the pool is ~60% of a round there - docs/INTEL_SYCL.md)
         # and on an SMT CPU one expert-pool worker more than the physical cores, the extras on SMT siblings: the pool is
