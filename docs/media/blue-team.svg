@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="140" viewBox="0 0 720 140" role="img" aria-label="Blue Team: Strata on Intel Arc GPUs">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a1f4d"/>
+      <stop offset="0.55" stop-color="#0b4fb3"/>
+      <stop offset="1" stop-color="#18a0fb"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="720" height="140" rx="18" fill="url(#bg)"/>
+  <rect x="0" y="0" width="720" height="70" rx="18" fill="url(#shine)"/>
+  <!-- stacked layers: the "strata" -->
+  <g transform="translate(46,28)">
+    <path d="M0 58 L42 38 L84 58 L42 78 Z" fill="#7fd0ff" opacity="0.55"/>
+    <path d="M0 42 L42 22 L84 42 L42 62 Z" fill="#a9e0ff" opacity="0.8"/>
+    <path d="M0 26 L42 6 L84 26 L42 46 Z" fill="#ffffff"/>
+  </g>
+  <text x="160" y="66" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="40" font-weight="800" fill="#ffffff" letter-spacing="2">BLUE TEAM</text>
+  <text x="162" y="100" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="20" fill="#d6ecff">Strata on Intel Arc GPUs · SYCL / oneAPI · Level Zero</text>
+</svg>

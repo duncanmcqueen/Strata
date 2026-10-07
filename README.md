@@ -3,6 +3,15 @@
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
+<p align="center"><img src="docs/media/blue-team.svg" width="720" alt="Blue Team: Strata on Intel Arc GPUs"></p>
+
+> **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) that adds support for Intel Arc GPUs.**
+> It adds a third GPU backend built with Intel's oneAPI (SYCL on Level Zero) next to the original NVIDIA (CUDA) and
+> AMD (HIP) ones. On an Arc A770 (16 GB) with a Ryzen 5 5600 it runs the Coder model end to end at about 16 tokens
+> per second, with 8.5K-token prompts answered correctly. Battlemage cards (B580, B70) are untested so far. The build,
+> every measurement and the known limits are in [docs/INTEL_SYCL.md](docs/INTEL_SYCL.md); the rest of this README is
+> the upstream project's and describes the NVIDIA and AMD builds. Not affiliated with or endorsed by Intel.
+
 <p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
