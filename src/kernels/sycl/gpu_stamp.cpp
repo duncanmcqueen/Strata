@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <sycl/ext/oneapi/experimental/clock.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <stdexcept>
 #include <string>
@@ -19,25 +20,42 @@ namespace strata::kernels {
 // stamp kernel reads that word past the GPU caches (mapped_host.hpp).  The reading is late by one PCIe read and the
 // writer's period, ~1-2 us - fine for the stage profiler's 50-500 us stages.  The thread keeps one core busy, so
 // this runs only in the opt-in STRATA_VERIFY_PROFILE.  A GPU with a device clock uses it.
+//
+// The writer must be JOINED, not detached: it never returns, and a detached thread outlives main() to write into a
+// host USM word the runtime tears down at exit.  On Battlemage that made `sycl_engine_kernels` segfault in the
+// writer during process exit (main in exit(), the thread at the atomic store).  A function-local static is
+// constructed on first use - after the SYCL runtime - so its destructor (which stops and joins the thread) runs
+// before the runtime's teardown, and the writer is gone before the word is freed.
 namespace {
-unsigned long long* host_clock_word() {
-    static unsigned long long* word = [] {
-        auto* w = sycl::malloc_host<unsigned long long>(8, sycl_runtime::context_shared());
-        if (w == nullptr) throw std::runtime_error("gpu_stamp: no host USM for the host clock");
-        const auto now = [] {
-            return (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        };
-        __atomic_store_n(w, now(), __ATOMIC_RELEASE);
-        std::thread([w, now] {
-            for (;;) {
-                __atomic_store_n(w, now(), __ATOMIC_RELEASE);
+unsigned long long now_ns() {
+    return (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct HostClock {
+    unsigned long long* word;
+    std::atomic<bool> stop{false};
+    std::thread writer;
+
+    HostClock() : word(sycl::malloc_host<unsigned long long>(8, sycl_runtime::context_shared())) {
+        if (word == nullptr) throw std::runtime_error("gpu_stamp: no host USM for the host clock");
+        __atomic_store_n(word, now_ns(), __ATOMIC_RELEASE);
+        writer = std::thread([this] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                __atomic_store_n(word, now_ns(), __ATOMIC_RELEASE);
                 for (int spin = 0; spin < 8; ++spin) __builtin_ia32_pause();
             }
-        }).detach();
-        return w;
-    }();
-    return word;
+        });
+    }
+    ~HostClock() {
+        stop.store(true, std::memory_order_relaxed);
+        if (writer.joinable()) writer.join();
+    }
+};
+
+unsigned long long* host_clock_word() {
+    static HostClock clock;   // joined at static destruction, before the SYCL runtime frees the word
+    return clock.word;
 }
 }  // namespace
 
