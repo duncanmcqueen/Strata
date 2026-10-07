@@ -7,8 +7,14 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 
 > **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) that adds support for Intel Arc GPUs.**
 > It adds a third GPU backend built with Intel's oneAPI (SYCL on Level Zero) next to the original NVIDIA (CUDA) and
-> AMD (HIP) ones. On an Arc A770 (16 GB) with a Ryzen 5 5600 it runs the Coder model end to end at about 16 tokens
-> per second, with 8.5K-token prompts answered correctly. Battlemage cards (B580, B70) are untested so far. The build,
+> AMD (HIP) ones. It runs the Coder model end to end on both Intel generations:
+>
+> | Card | Writes answers | Reads your prompt |
+> | --- | ---: | ---: |
+> | Arc Pro B70 (Battlemage, 32 GB, OcuLink), Core Ultra 5 125H | 30.7-35.6 tokens/s | 383-395 tokens/s |
+> | Arc A770 (Alchemist, 16 GB, PCIe 3.0 x4), Ryzen 5 5600 | ~16 tokens/s | 106-130 tokens/s |
+>
+> The B70 holds every expert in VRAM; the A770 shares them with the CPU. The build,
 > every measurement and the known limits are in [docs/INTEL_SYCL.md](docs/INTEL_SYCL.md); the rest of this README is
 > the upstream project's and describes the NVIDIA and AMD builds. Not affiliated with or endorsed by Intel.
 
