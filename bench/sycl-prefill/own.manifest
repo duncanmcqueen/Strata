@@ -1,0 +1,2 @@
+own-8k-auto|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=4 STRATA_PREFILL_TIMING=1 STRATA_SYCL_PREFILL_OWN=1|
+own-8k-noborrow-8192|bench/sycl-prefill/artifacts/prompt8k2.ids|8192|MAX_CONTEXT=16384 MAX_NEW=4 STRATA_PREFILL_TIMING=1|

@@ -1,0 +1,2 @@
+noborrow-8k-c8192|bench/sycl-prefill/artifacts/prompt8k2.ids|8192|MAX_CONTEXT=16384 MAX_NEW=4 STRATA_PREFILL_TIMING=1|--no-prefill-borrow
+noborrow-8k-c4096|bench/sycl-prefill/artifacts/prompt8k2.ids|4096|MAX_CONTEXT=16384 MAX_NEW=4 STRATA_PREFILL_TIMING=1|--no-prefill-borrow

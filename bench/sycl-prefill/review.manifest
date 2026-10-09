@@ -1,0 +1,37 @@
+# Review-fix rerun: final build, three alternating tail/head repetitions per workload.
+review-short-tail-1|bench/sycl-prefill/artifacts/prompt_short.ids|auto:8192|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-short-head-1|bench/sycl-prefill/artifacts/prompt_short.ids|auto:8192|MAX_CONTEXT=8192 MAX_NEW=64|
+review-short-tail-2|bench/sycl-prefill/artifacts/prompt_short.ids|auto:8192|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-short-head-2|bench/sycl-prefill/artifacts/prompt_short.ids|auto:8192|MAX_CONTEXT=8192 MAX_NEW=64|
+review-short-tail-3|bench/sycl-prefill/artifacts/prompt_short.ids|auto:8192|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-short-head-3|bench/sycl-prefill/artifacts/prompt_short.ids|auto:8192|MAX_CONTEXT=8192 MAX_NEW=64|
+review-8k-tail-1|bench/sycl-prefill/artifacts/prompt8k2.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-8k-head-1|bench/sycl-prefill/artifacts/prompt8k2.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+review-8k-tail-2|bench/sycl-prefill/artifacts/prompt8k2.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-8k-head-2|bench/sycl-prefill/artifacts/prompt8k2.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+review-8k-tail-3|bench/sycl-prefill/artifacts/prompt8k2.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-8k-head-3|bench/sycl-prefill/artifacts/prompt8k2.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+review-32k-tail-1|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-32k-head-1|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+review-32k-tail-2|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-32k-head-2|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+review-32k-tail-3|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-32k-head-3|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+review-nr8k-tail-1|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-nr8k-head-1|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+review-nr8k-tail-2|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-nr8k-head-2|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+review-nr8k-tail-3|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-nr8k-head-3|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+review-nr32k-tail-1|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-nr32k-head-1|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+review-nr32k-tail-2|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-nr32k-head-2|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+review-nr32k-tail-3|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-nr32k-head-3|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+review-261k-tail-1|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-261k-head-1|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64|
+review-261k-tail-2|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-261k-head-2|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64|
+review-261k-tail-3|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+review-261k-head-3|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64|

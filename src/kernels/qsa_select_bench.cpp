@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -162,8 +163,56 @@ int main(int argc, char** argv) {
         return ms / reps;
     };
     const float t_old = timed(run_old), t_new = have_tc ? timed(run_new) : t_old;
+#if defined(STRATA_USE_SYCL)
+    // W2: query-tiled shared-key scorer vs the reference single-query-per-row scorer (bitwise).
+    auto run_tiled = [&] {
+        k::qsa_block_scores_tiled(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_new, nullptr, active);
+    };
+    run_tiled();
+    ck(cudaDeviceSynchronize(), "tiled warm");
+    std::vector<float> ta((size_t) (nq * max_blocks)), tb(ta.size());
+    ck(cudaMemcpy(ta.data(), sc_old, ta.size() * 4, cudaMemcpyDeviceToHost), "down");
+    ck(cudaMemcpy(tb.data(), sc_new, tb.size() * 4, cudaMemcpyDeviceToHost), "down");
+    int64_t bitwise = 0, live = 0;
+    for (int64_t i = 0; i < nq; ++i) {
+        const int64_t nbid = steps[(size_t) (i * k::kStepCount + k::kStepNBid)];
+        for (int64_t j = 0; j <= nbid; ++j) {
+            ++live;
+            if (std::memcmp(&ta[(size_t) (i * max_blocks + j)], &tb[(size_t) (i * max_blocks + j)], 4) == 0) ++bitwise;
+        }
+    }
+    const float t_tiled = timed(run_tiled);
+    std::printf("tiled scorer %s: %.3f ms (%.2fx vs warp %.3f ms); bitwise identical %lld/%lld live\n",
+                bitwise == live ? "ok" : "DIFFERS", t_tiled, t_old / t_tiled, t_old, (long long) bitwise, (long long) live);
+#endif
     const float t_tk = timed([&] { k::qsa_block_topk_ref(sc_old, d_steps, nq, max_blocks, cap, s, ids_old, nullptr); });
     const float t_tk2 = timed([&] { k::qsa_block_topk(sc_old, d_steps, nq, max_blocks, cap, s, ids_reg, nullptr, active); });
+#if defined(STRATA_USE_SYCL)
+    // W1: the exact hierarchical selector vs the reference selector it replaces beyond the register capacity.
+    uint8_t* ws = nullptr;
+    const uint64_t ws_bytes = k::qsa_topk_workspace_bytes(nq, max_blocks);
+    ck(cudaMalloc(&ws, ws_bytes), "malloc");
+    int32_t* ids_h = nullptr;
+    ck(cudaMalloc(&ids_h, (size_t) (nq * cap) * 4), "malloc");
+    const bool hier_ok0 =
+        k::qsa_block_topk_hier(sc_old, d_steps, nq, max_blocks, cap, s, ids_h, nullptr, ws, ws_bytes);
+    ck(cudaDeviceSynchronize(), "hier warm");
+    int64_t hier_same = 0;
+    if (hier_ok0) {
+        std::vector<int32_t> ih(ia.size());
+        ck(cudaMemcpy(ih.data(), ids_h, ih.size() * 4, cudaMemcpyDeviceToHost), "down");
+        for (int64_t i = 0; i < nq; ++i) {
+            const int64_t w = steps[(size_t) (i * k::kStepCount + k::kStepWidth)];
+            if (std::equal(ia.begin() + i * cap, ia.begin() + i * cap + w, ih.begin() + i * cap)) ++hier_same;
+        }
+    }
+    const float t_hier = hier_ok0 ? timed([&] {
+        k::qsa_block_topk_hier(sc_old, d_steps, nq, max_blocks, cap, s, ids_h, nullptr, ws, ws_bytes);
+    }) : -1.0f;
+    std::printf("hier top-k %s: %.3f ms (%.2fx vs reference %.3f ms); ids identical to reference %lld/%lld\n",
+                hier_ok0 ? "ok" : "refused", t_hier, t_hier > 0 ? t_tk / t_hier : 0.0, t_tk, (long long) hier_same,
+                (long long) nq);
+#endif
     std::printf("top-k %.3f -> %.3f ms (%.1fx), register top-k identical to the reference %lld/%lld\n", t_tk, t_tk2,
                 t_tk / t_tk2, (long long) reg_same, (long long) nq);
     std::printf("%s accuracy vs FP64 (score scale %.3g): warp kernel max err %.3g, fast scorer max err %.3g (%.2g of scale)\n",

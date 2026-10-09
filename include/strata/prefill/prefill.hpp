@@ -38,6 +38,9 @@ struct PrefillStats {
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
+    double ms_expert_host = 0;      ///< (STRATA_PREFILL_TIMING) host wall inside the FP16 fallback's per-expert product
+    int64_t expert_products = 0;    ///< (STRATA_PREFILL_TIMING) per-expert dequant+GEMM invocations
+    int64_t gemm_calls = 0;         ///< (STRATA_PREFILL_TIMING) m.gemm.f16 calls (2 per fallback expert product)
 };
 
 }  // namespace strata::prefill

@@ -289,6 +289,13 @@ void test_resident_lend_region() {
     require(choose_resident_keep_from(slots, 10, 100, -1) == 4, "no lend region kept slots in RAM");
     require(choose_resident_keep_from(slots, 10, 100, 9) == 4, "an out-of-range lend region kept slots in RAM");
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
+    require(choose_resident_keep_to(slots, 10, 9, 3) == -1, "head: base exceeds budget");
+    require(choose_resident_keep_to(slots, 10, 10, 3) == 0, "head: no space for lent experts");
+    require(choose_resident_keep_to(slots, 10, 15, 3) == 1, "head: first slot kept first");
+    require(choose_resident_keep_to(slots, 10, 17, 3) == 1, "head: stop before a slot exceeding budget");
+    require(choose_resident_keep_to(slots, 10, 18, 3) == 2, "head: two slots fit");
+    require(choose_resident_keep_to(slots, 10, 100, 3) == 3, "head: respect loan endpoint");
+    require(choose_resident_keep_to({}, 0, 0, 0) == 0, "head: empty cache");
 }
 
 void test_resident_exchange() {

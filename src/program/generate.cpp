@@ -20,6 +20,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/prefill/cache_loan.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -5674,8 +5675,7 @@ int main(int argc, char** argv) {
     // from the live session or the longest conversation checkpoint its prompt starts with (see ConvCheckpoint),
     // otherwise from an empty sequence (`session_zero`); the rest of the prompt goes through the batched prompt path
     // and its last token through the first verify window - the path all three model files share.  Decoding is greedy.
-    // The expert-cache slots (from the end of the cache) that hold the prompt path's buffers for a chunk, and the
-    // bytes from the first of them to the end.
+    // The expert-cache range holding prompt buffers is shared by the pinning and execution plans.
     // the share of expert bytes the arena could pin (sizes the prompt path's streamed ring and its lend cap)
     if (srcp != nullptr && o.prefill_chunk > 0) {
         uint64_t pinned = 0, total = 0;
@@ -5688,17 +5688,23 @@ int main(int argc, char** argv) {
             }
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
-    // bytes -> slots for CUDA0's cache: exact when it knows its per-slot offsets (a native pack's blobs differ
-    // per layer), otherwise max_blob each.
-    auto slots_from_bytes = [&](uint64_t need) -> int64_t {
-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-        int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-        if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
-            k = 0;
-            while (k < xcache.slots() &&
-                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
-        }
-        return k;
+    // One range policy for resident pinning, generation and persistent-server loans.
+    const bool lend_head = [] {
+#if defined(STRATA_USE_SYCL)
+        return std::getenv("STRATA_PREFILL_LEND_TAIL") == nullptr;
+#else
+        return false;
+#endif
+    }();
+    auto cache_loan = [&](const strata::core::ExpertCache& cache, uint64_t need) {
+        return strata::prefill::cache_loan(cache.slots(), cache.slot_offsets(),
+            strata::kernels::cpu::expert_layout().max_blob, need, lend_head);
+    };
+    auto lend_slots = [&](int64_t c) -> int64_t {
+        return cache_loan(xcache, strata::prefill::Prefill::bytes_needed(g, ss, c)).count();
+    };
+    auto lend_first_slot = [&](int64_t k) -> int32_t {
+        return lend_head ? 0 : (int32_t) (xcache.slots() - k);
     };
     // ...and its inverse, for the ring's room: the bytes the cache's last `k` slots hold.  k can arrive <= 0: the
     // caller's lend budget is `min(slots - 128, pct * slots / 100)` and goes negative on a cache smaller than 128
@@ -5708,9 +5714,6 @@ int main(int argc, char** argv) {
         if (xcache.slot_offsets() != nullptr)
             return (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]);
         return (uint64_t) k * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
-    };
-    auto lend_slots = [&](int64_t c) -> int64_t {
-        return slots_from_bytes(strata::prefill::Prefill::bytes_needed(g, ss, c));
     };
     // `lend_bytes` went with the single-cache serve loan: a participant's loan is priced by `part_bytes` from its
     // OWN cache, and the only other user of the old helper was the serve path's own relayout.
@@ -6058,7 +6061,7 @@ int main(int argc, char** argv) {
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
     // hold are copied from experts.bin into RAM once, so no decode or prompt step reads the file (the plain mmap
     // mode reads them through the OS file cache, which a small-RAM PC keeps giving back to the SSD).  Built here,
-    // after the prompt path's lend plan is known: the slots it may lend (the cache's last ones) have their experts
+    // after the prompt path's lend plan is known: the selected head or tail slots have their experts
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
@@ -6090,10 +6093,14 @@ int main(int argc, char** argv) {
     }
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
+        int64_t lend_to = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
             int64_t chunk = o.prefill_chunk;
             const int64_t k = plan_lend(chunk);
-            if (k > 0) lend_from = xcache.slots() - k;
+            if (k > 0) {
+                lend_from = lend_first_slot(k);       // SYCL: the cache's first slots (see lend_first_slot)
+                lend_to = lend_from + k;
+            }
         }
         // a layer split: the experts every later stage's cache holds are left out of the RAM copy, as CUDA0's are
         // (with them the copy keeps no lend region: pin_cache_complement turns the loan off)
@@ -6103,8 +6110,8 @@ int main(int argc, char** argv) {
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
-        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
-                                                    o.resident_headroom, o.resident_budget, &rank_all);
+        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
+                                                    o.resident_budget, &profile, lend_to);
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
@@ -6214,8 +6221,8 @@ int main(int argc, char** argv) {
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
         // ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (layers [0, split_at[0]),
-        // which is the whole model without a split) borrowing the tail of CUDA0's cache, then one per stage
-        // borrowing the tail of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the
+        // which is the whole model without a split) borrowing a range of CUDA0's cache, then one per stage
+        // borrowing a range of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the
         // chunk, is laid out by `Prefill::relayout`, and is refilled before any window reads - so outside the
         // prompt the whole cache is expert cache.  THIS IS THE POINT OF THE STRUCT: the loan used to exist only
         // for CUDA0, and `no_prefill_borrow` made every stage instead withhold a chunk-sized reserve from its
@@ -6234,26 +6241,14 @@ int main(int argc, char** argv) {
             int64_t lent_chunk = 0;
             std::vector<std::pair<int32_t, int32_t>> lent;
         };
-        // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
-        // per layer), otherwise max_blob each.
-        auto cache_slots_for = [&](const strata::core::ExpertCache& xc, uint64_t need) -> int64_t {
-            if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
-                int64_t k = 0;
-                while (k < xc.slots() &&
-                       (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
-                return k;
-            }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+        auto part_loan = [&](const PfPart& p, int64_t c) {
+            return cache_loan(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c));
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
-            return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c));
+            return part_loan(p, c).count();
         };
-        auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
-            strata::core::ExpertCache& xc = *p.cache;
-            return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
-                                     : (uint64_t) (xc.slots() - first) *
-                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+        auto part_bytes = [&](const PfPart& p, int64_t c) -> uint64_t {
+            return part_loan(p, c).bytes;
         };
         // #340: a layer split whose caches already hold most experts streams few of them through the prompt path, so
         // the 384-slot ring (sized for a card that streams nearly every expert of a chunk) only makes every stage's
@@ -6415,7 +6410,7 @@ int main(int argc, char** argv) {
                                          "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
                 for (PfPart& p : pf_parts) {
-                    p.first = (int32_t) (p.cache->slots() - part_slots(p, chunk));
+                    p.first = (int32_t) part_loan(p, chunk).first;
                     p.first_now = p.first;
                 }
                 // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
@@ -6445,7 +6440,7 @@ int main(int argc, char** argv) {
                 }
                 lend_first = pf_parts[0].first;
                 borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
-                borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+                borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], o.prefill_chunk) : 0;
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             } else if (pf_parts.size() > 1) {
@@ -6469,12 +6464,12 @@ int main(int argc, char** argv) {
         if (any_loan) {
             if (borrow != nullptr)
                 std::fprintf(stderr, "strata serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
-                             (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
+                             (long long) part_slots(pf_parts[0], o.prefill_chunk), (double) borrow_bytes / 1073741824.0);
             for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
                 if (pf_parts[i].first >= 0) std::fprintf(stderr, "strata serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
-                             pf_parts[i].dev, (long long) (pf_parts[i].cache->slots() - pf_parts[i].first),
+                             pf_parts[i].dev, (long long) part_slots(pf_parts[i], o.prefill_chunk),
                              (long long) pf_parts[i].cache->slots(),
-                             (double) part_bytes(pf_parts[i], pf_parts[i].first) / 1073741824.0);
+                             (double) part_bytes(pf_parts[i], o.prefill_chunk) / 1073741824.0);
         } else {
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         }
@@ -6494,7 +6489,7 @@ int main(int argc, char** argv) {
                 // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
                 if (i + 1 < pf_parts.size() && pf_parts[i + 1].first >= 0) {
                     sb = st.cache.device_slot(pf_parts[i + 1].first);
-                    sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
+                    sbb = part_bytes(pf_parts[i + 1], o.prefill_chunk);
                 }
                 if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
@@ -6569,12 +6564,12 @@ int main(int argc, char** argv) {
                 if (any_loan) {                  // smaller loans for the smaller chunk
                     for (PfPart& p : pf_parts)
                         if (p.first >= 0) {
-                            p.first = (int32_t) (p.cache->slots() - part_slots(p, next));
+                            p.first = (int32_t) part_loan(p, next).first;
                             p.first_now = p.first;
                         }
                     lend_first = pf_parts[0].first;
                     borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
-                    borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+                    borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], o.prefill_chunk) : 0;
                 }
                 err.clear();
                 continue;
@@ -6623,17 +6618,17 @@ int main(int argc, char** argv) {
             int64_t evicted = 0;
             for (PfPart& p : pf_parts) {
                 if (S <= 0 || p.first < 0) continue;
-                const int32_t first_s = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, S)));
+                const auto small_loan = part_loan(p, S);
                 int64_t n = 0;
                 for (int64_t l = p.lb; l < p.le; ++l)
                     for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                         int32_t& r = host_res[(size_t) (l * g.n_expert + ex)];
-                        if (r >= first_s) { r = strata::core::kNotResident; ++n; }
+                        if (small_loan.contains(r)) { r = strata::core::kNotResident; ++n; }
                     }
                 evicted += n;
                 std::fprintf(stderr, "strata serve:   CUDA%d keeps %lld slots for %lld-token prompts (%lld experts "
                                      "no longer resident)\n", p.dev < 0 ? 0 : p.dev,
-                             (long long) (p.cache->slots() - first_s), (long long) S, (long long) n);
+                             (long long) small_loan.count(), (long long) S, (long long) n);
             }
             if (evicted > 0) {
                 if (d_res != nullptr)
@@ -9631,7 +9626,7 @@ int main(int argc, char** argv) {
                 return true;
             };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
-            // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
+            // rounded up to 256), laid out in the selected head or tail range - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
@@ -9657,15 +9652,16 @@ int main(int argc, char** argv) {
                         if (!refill_one(p, e)) return false;
                     }
                     const strata::core::OnDevice on(p.dev);
-                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
+                    const auto loan = part_loan(p, want);
+                    const int32_t first = (int32_t) loan.first;
                     if (want != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        if (!p.sp->relayout(want, p.cache->device_slot(first), loan.bytes, e)) return false;
                         p.first_now = first;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
-                            if (host_res[i] >= first) {
+                            if (loan.contains(host_res[i])) {
                                 p.lent.emplace_back((int32_t) i, host_res[i]);
                                 host_res[i] = strata::core::kNotResident;
                                 any = true;
@@ -11156,22 +11152,27 @@ int main(int argc, char** argv) {
             }
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
-                const int32_t first = (int32_t) (xcache.slots() - k);
-                // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
-                kvg_started = true;
-                kvg_start(first);
-                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= first) {
-                        lent.emplace_back((int32_t) i, host_res[i]);
+                const int32_t first = lend_first_slot(k);
+                for (size_t i = 0; i < host_res.size(); ++i) {
+                    const int32_t s = host_res[i];
+                    if (s >= first && s < first + (int32_t) k) {   // kNotResident (-1) never matches
+                        lent.emplace_back((int32_t) i, s);
                         host_res[i] = strata::core::kNotResident;
                     }
-                res_put(d_res);
+                }
+                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 borrow = xcache.device_slot(first);
-                borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
-                                                     : (uint64_t) k * (uint64_t) blob;
-                std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)\n", (long long) k,
-                             (double) borrow_bytes / 1073741824.0);
+                borrow_bytes = xcache.slot_offsets()
+                                   ? (uint64_t) (xcache.slot_offsets()[first + k] - xcache.slot_offsets()[first])
+                                   : (uint64_t) k * (uint64_t) blob;
+                std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)%s\n", (long long) k,
+                             (double) borrow_bytes / 1073741824.0,
+#if defined(STRATA_USE_SYCL)
+                             first == 0 ? " at the cache's start (SYCL: low GEMM operand offsets)" : ""
+#else
+                             ""
+#endif
+                             );
             }
         }
         if (borrow == nullptr)

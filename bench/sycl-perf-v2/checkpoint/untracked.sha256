@@ -1,0 +1,3 @@
+2a6f66801a4d2172444f83849b699a00a39e88b46ee025851ca4e8c309831a86  include/strata/prefill/cache_loan.hpp
+e3409fcfd111bb7189155c491c42de27b85237349a880fa85440e7de9c44ef14  tests/core/prefill_cache_loan_test.cpp
+5d544a3cacb7ae4d20f54a78f808bd1edbfe434e146a08286a33e864f4c9bc9e  tests/sycl/matrix_probe.cpp

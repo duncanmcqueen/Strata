@@ -1,0 +1,4 @@
+p4-short-head-1|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64|
+p4-nr8k-head-1|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+p4-nr32k-head-1|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+p4-261k-head-1|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64|

@@ -1,0 +1,45 @@
+post-implementation source checkpoint 2026-10-07T08:42:43-05:00
+HEAD 84e47edce38753fa2c7045fcefdb20176bf49fb0
+ M CMakeLists.txt
+ M cmake/sycl_backend.cmake
+ M docs/INTEL_SYCL.md
+ M include/strata/core/expert_source.hpp
+ M include/strata/core/layer.hpp
+ M include/strata/kernels/qsa_select.hpp
+ M include/strata/prefill/prefill.hpp
+ M src/core/expert_source.cpp
+ M src/core/layer.cpp
+ M src/core/sycl/device.cpp
+ M src/kernels/qsa_select_bench.cpp
+ M src/kernels/sycl/qsa_select.cpp
+ M src/prefill/prefill.cpp
+ M src/program/generate.cpp
+ M src/sycl_runtime/blas.cpp
+ M tests/core/file_expert_source_test.cpp
+ M tests/sycl/qsa_select.cpp
+?? bench/sycl-perf-v2/
+?? bench/sycl-prefill/
+?? include/strata/prefill/cache_loan.hpp
+?? include/strata/sycl_runtime/device_profile.hpp
+?? src/sycl_runtime/device_profile.cpp
+?? tests/core/prefill_cache_loan_test.cpp
+?? tests/sycl/device_profile_test.cpp
+?? tests/sycl/matrix_probe.cpp
+ CMakeLists.txt                         |  16 +
+ cmake/sycl_backend.cmake               |  10 +
+ docs/INTEL_SYCL.md                     |  99 ++++++
+ include/strata/core/expert_source.hpp  |  10 +-
+ include/strata/core/layer.hpp          |   2 +
+ include/strata/kernels/qsa_select.hpp  |  40 +++
+ include/strata/prefill/prefill.hpp     |   3 +
+ src/core/expert_source.cpp             |  65 +++-
+ src/core/layer.cpp                     |   8 +-
+ src/core/sycl/device.cpp               |   9 +-
+ src/kernels/qsa_select_bench.cpp       |  49 +++
+ src/kernels/sycl/qsa_select.cpp        | 571 +++++++++++++++++++++++++++++++++
+ src/prefill/prefill.cpp                |  58 +++-
+ src/program/generate.cpp               | 120 +++----
+ src/sycl_runtime/blas.cpp              |  45 +++
+ tests/core/file_expert_source_test.cpp |   7 +
+ tests/sycl/qsa_select.cpp              | 185 +++++++++++
+ 17 files changed, 1214 insertions(+), 83 deletions(-)

@@ -1,0 +1,3 @@
+69595f0ba6877dd382e187b0ba3c6070e5ec0fa67f62702013a1d702e350fdf9  build-sycl/strata
+4faa1030b81eba3481e6fedf0eae98d652f07f0fd1541442db0f3073105d6d22  build-sycl/libstrata_sycl_runtime.so
+ccedd5fb6371bbab191c197e79d33cf8907f31fa1293679e00394e19d1aef8c0  build-sycl/libstrata_sycl_kernels_base.so

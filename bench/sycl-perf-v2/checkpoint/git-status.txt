@@ -1,0 +1,14 @@
+ M CMakeLists.txt
+ M docs/INTEL_SYCL.md
+ M include/strata/core/expert_source.hpp
+ M include/strata/prefill/prefill.hpp
+ M src/core/expert_source.cpp
+ M src/prefill/prefill.cpp
+ M src/program/generate.cpp
+ M src/sycl_runtime/blas.cpp
+ M tests/core/file_expert_source_test.cpp
+?? bench/sycl-perf-v2/
+?? bench/sycl-prefill/
+?? include/strata/prefill/cache_loan.hpp
+?? tests/core/prefill_cache_loan_test.cpp
+?? tests/sycl/matrix_probe.cpp

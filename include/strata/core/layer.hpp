@@ -378,6 +378,8 @@ struct QsaBuffers {
     float* attn32 = nullptr;
     uint8_t* attn_q8k = nullptr;
     float* attn_scratch = nullptr;   ///< plan v0.3 P3: split-K decode attention partials
+    void* topk_ws = nullptr;         ///< SYCL W1: hierarchical top-k workspace (per instance, capture-safe)
+    uint64_t topk_ws_bytes = 0;
 };
 
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells);

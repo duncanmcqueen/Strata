@@ -1,0 +1,1 @@
+qstats-short|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=8 STRATA_SYCL_QSTATS=1|
