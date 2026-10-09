@@ -8,6 +8,7 @@
 //   * there is no compute-capability floor: the runtime reports an 8.0 sentinel (docs/INTEL_SYCL.md) and refuses
 //     a GPU without 32-wide sub-groups at enumeration, which is the real requirement here.
 #include "strata/core/device.hpp"
+#include "strata/sycl_runtime/device_profile.hpp"
 #include "strata/sycl_runtime/queue_bridge.hpp"
 
 #include <cuda_runtime.h>
@@ -51,9 +52,13 @@ bool device_summary(int ordinal, std::string& name, std::string& detail) {
         cudaGetLastError();
         return false;
     }
+    // Build the immutable per-device profiles here: startup, outside any graph capture, so no device query ever
+    // runs mid-capture when a selector is first consulted.
+    sycl_runtime::warm_device_profiles();
+    const sycl_runtime::DeviceProfile& prof = sycl_runtime::profile_for_device(ordinal);
     char buf[160];
-    std::snprintf(buf, sizeof(buf), "Level Zero, %d compute units, %.1f GiB, sub-group 32", p.multiProcessorCount,
-                  (double) p.totalGlobalMem / (1024.0 * 1024 * 1024));
+    std::snprintf(buf, sizeof(buf), "Level Zero, %d compute units, %.1f GiB, sub-group 32, arch=%s", p.multiProcessorCount,
+                  (double) p.totalGlobalMem / (1024.0 * 1024 * 1024), sycl_runtime::arch_name(prof.arch));
     name = p.name;
     detail = buf;
     return true;

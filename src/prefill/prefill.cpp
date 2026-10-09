@@ -22,6 +22,16 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+// W1 top-k dispatch: on SYCL the selector is device-aware and takes the instance-owned hierarchical workspace
+// (allocated in carve(), alive for the whole prefill). Other backends keep the original entry point.
+#if defined(STRATA_USE_SYCL)
+#define QSA_TOPK_CALL(scores, steps, nq, mb, cap, shapes, ids, stream, active)                                     \
+    strata::kernels::qsa_block_topk_ws(scores, steps, nq, mb, cap, shapes, ids, stream, m.sel_ws, m.sel_ws_bytes,  \
+                                       active)
+#else
+#define QSA_TOPK_CALL(scores, steps, nq, mb, cap, shapes, ids, stream, active)                                     \
+    strata::kernels::qsa_block_topk(scores, steps, nq, mb, cap, shapes, ids, stream, active)
+#endif
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
@@ -442,6 +452,8 @@ struct Prefill::Impl {
     std::vector<int32_t> steps_host;
     int32_t* sel_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
+    void* sel_ws = nullptr;               // W1 hierarchical top-k workspace (bounded by sel_batch x max_blocks)
+    uint64_t sel_ws_bytes = 0;
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
     int64_t attn_batch = 32, cap = 0;
@@ -584,6 +596,10 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
     a.take<float>(T * 128, ok); a.take<float>(T * 512, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
     a.take<int32_t>(T * (size_t) cap, ok);
     a.take<float>((size_t) sel_batch * (size_t) max_blocks, ok);
+#if defined(STRATA_USE_SYCL)
+    // W1 hierarchical top-k workspace: bounded prefill batch, not T times the context.
+    a.take<uint8_t>((size_t) strata::kernels::qsa_topk_workspace_bytes(sel_batch, max_blocks), ok);
+#endif
     a.take<float>((size_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
     return a.used;
 }
@@ -819,6 +835,10 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.attn = b.take<float>(T * ZV, ok); m.attn_h = b.take<uint16_t>(T * ZV, ok);
         m.sel_ids = b.take<int32_t>(T * (size_t) m.cap, ok);
         m.sel_scores = b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok);
+#if defined(STRATA_USE_SYCL)
+        m.sel_ws_bytes = strata::kernels::qsa_topk_workspace_bytes(m.sel_batch, m.max_blocks);
+        m.sel_ws = b.take<uint8_t>((size_t) m.sel_ws_bytes, ok);
+#endif
         m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
         Alloc c;
         c.base = base; c.cap = region; c.owned = &m.owned;
@@ -1218,11 +1238,14 @@ namespace {
 // the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
 // host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
 // are folded at every MoE layer's host sync, after which all of them have completed.
-enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
-               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfCount };
-const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
-                                        "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
+enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaScore, kPfTopk, kPfQsaSel, kPfQsaAttn, kPfRouter,
+               kPfHostGroup, kPfGather, kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage,
+               kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfCount };
+// kPfQsaSel is the historical combined score+top-k phase (kept so old logs stay readable; it is 0 on the new
+// path, which charges kPfQsaScore and kPfTopk instead).  Never sum kPfQsaSel with its components.
+const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa score",
+                                        "qsa topk", "qsa select", "qsa attn", "router+shared",
+                                        "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
                                         "gdn recurrence", "gdn out proj"};
 struct PfTimer {
@@ -1820,7 +1843,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                                        strata::kernels::rope_scaling(), m.cs);
                         }
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
-                    pt.mark(kPfQsaSel, cs);
+                    pt.mark(kPfQsaScore, cs);
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
@@ -1834,8 +1857,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                                              m.cs, active))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
-                        strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
-                                                        m.sel_ids + t0 * m.cap, m.cs, active);
+                    }
+                    // W0: top-k charged separately from scoring (the gap between the two marks includes any wait).
+                    pt.mark(kPfTopk, cs);
+                    for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
+                        const int64_t nb = std::min(m.sel_batch, T - t0);
+                        const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
+                        const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
+                                                                                strata::kernels::kStepNBid)] + 1;
+                        QSA_TOPK_CALL(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s, m.sel_ids + t0 * m.cap, m.cs,
+                                      active);
                     }
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
@@ -2460,6 +2491,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 return true;
                             }
                             const int q = (int) (j % DQ);
+                            static const bool pf_host = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+                            const auto thost = pf_host ? Clock::now() : Clock::time_point{};
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
@@ -2476,6 +2509,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                             pt.mark(kPfGemmD, cs);
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            if (pf_host) {   // P0: host time in the per-expert product, to separate host dispatch from GPU work
+                                stats_.ms_expert_host += ms_since(thost);
+                                ++stats_.expert_products;
+                                stats_.gemm_calls += 2;
+                            }
                             return true;
                         };
                         if (!stream_all) {
@@ -2688,6 +2726,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        if (stats_.expert_products > 0)
+            std::fprintf(stderr, "strata prefill timing: expert products %lld (%.0f ms host total, %.3f ms host each), %lld GEMMs\n",
+                         (long long) stats_.expert_products, stats_.ms_expert_host,
+                         stats_.ms_expert_host / (double) stats_.expert_products, (long long) stats_.gemm_calls);
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;

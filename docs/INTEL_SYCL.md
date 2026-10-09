@@ -229,6 +229,48 @@ The xe driver kills a GPU job that runs longer than its job timeout (`job_timeou
 waits last as long as the CPU pool: with the experts on disk instead of in RAM (`--mmap-experts` after a long prompt
 evicted the page cache) a first window ran past it and the engine was reset.  The RAM tier keeps the pool short.
 
+### Prefill buffer placement and the >4 GiB GEMM workaround
+
+Historical B70 runs (2026-10-06, Coder native pack, INT8 KV, resident experts) showed that
+borrowing prefill buffers from low cache offsets substantially reduced time spent on the
+protected GEMM path. Repeated 8K/32K prompts improved from median final prefill times
+20,998.5/75,929.0 ms to 10,258.9/34,841.9 ms (three runs each). These numbers precede the
+review fixes; they are not measurements of the corrected persistent-server path.
+
+On SYCL, generation and the persistent server now borrow the cache's first slots.
+`STRATA_PREFILL_LEND_TAIL=1` selects the old tail policy. The selected range is sized using
+actual slot offsets, so native packs with variable-sized slots are supported. Resident RAM
+pinning follows that range; requests mark and restore only slots in their actual loan.
+Other backends continue to borrow the tail.
+
+Low offsets reduce staging but large loans can still cross 4 GiB. The BLAS workaround and
+small-output repeatability protection remain enabled. `STRATA_SYCL_GEMM_STAGE_STATS=1`
+reports copy counts/bytes and host submission time; it does not measure device copy duration.
+The initial byte counter overcounted output copies, so its published traffic and inferred
+copy-time estimates have been withdrawn pending a corrected GPU run.
+
+The saved 8K head/tail residual samples are byte-identical. Long-context and non-repeated
+candidate timings have only one saved repetition each, and the short-prompt median came
+from an earlier variant. The complete regression gates and repeated-server validation
+remain pending. See `bench/sycl-prefill/REPORT.md` and `REVIEW_FIXES.md` in that directory
+for evidence, limitations and required reruns.
+
+`--no-prefill-borrow --prefill 8192` remains an opt-in alternative with its own allocation.
+Historical single runs were fast, but its additional reserve reduced the expert cache and
+regressed long-context continuation decode by about 10%; it is not the default.
+
+### The matrix extension on the B70
+
+`tests/sycl/matrix_probe.cpp` (linked against the kernel libraries) is the capability gate.  On
+bmg-g31 with DPC++ 2026.0, FP16 and BF16 `joint_matrix` 16x16x16 (FP32 accumulate) and INT8
+`joint_matrix` **8x16x32** (INT32 accumulate) are exact against an independent reference, with ragged
+(zero-padded guard regions) shapes and multiple work-items.  INT8 `16x16x16` is rejected at AOT time
+("unsupported number of rows/columns" and undefined `OpJointMatrix...INTEL` builtins).  The probe also
+shows the two traps for a tiled kernel: tiled M/N stores need the *padded* stride, and every tile load
+must stay inside a sized guard region.  A full XMX expert kernel was not pursued in this iteration. The probe kernel is in the
+test translation unit; linking the libraries does not establish in-library integration.
+The floating-point oracle now rejects nonfinite results and includes NaN/Inf negative controls.
+
 ### The per-layer handoff over the link
 
 Measured with `STRATA_VERIFY_LAYER_MS=1` and a standalone model of the handoff (one graph of 48 layers and a host
@@ -573,3 +615,60 @@ the kernel library and every executable.
   are skipped). Without this, `sycl_qsa_parity`'s sequential indexer appends raced their
   input upload and failed 5 of 15 runs once launches got faster; with it, 0 of 20.
   Kernels and async copies on the null stream are not yet ordered against blocking streams.
+
+## Architecture-aware dispatch and the W1/W2 selection work (2026-10-07)
+
+Strata now picks its SYCL kernels from the **actual device** rather than a fixed default, so B70, A770 and other
+Intel GPUs can each run their best qualified path without editing kernel flags. This is the section 1A
+infrastructure plus the first two qualified optimizations.
+
+**Device profile and selectors.** `include/strata/sycl_runtime/device_profile.hpp` and
+`src/sycl_runtime/device_profile.cpp` build one immutable profile per runtime device from the existing registry:
+vendor, PCI device ID, architecture (`dg2` for Alchemist/A770, `bmg` for Battlemage/B70 and the B-series,
+otherwise `unknown`), driver/compiler identity, sub-group sizes, local memory, separately-represented matrix tile
+capabilities, and which kernel families this build compiles. Classification is by device ID / capability query,
+never by a marketing name. The selection functions are pure (device profile + shape + workspace budget + optional
+override → kernel/tile/scratch/reason) and are unit-tested with synthetic profiles, so an A770-only machine can
+check its own selectors without owning a B70 (`sycl_device_profile_test`, 13 groups, no GPU).
+
+**Policy.** Reject unsupported geometry/capability/scratch → honour a supported explicit override (an unsupported
+force fails *before* any launch) → pick a qualified record matching this exact device and shape bucket → otherwise
+the established safe path. `auto` uses built-in per-device winners; a record from another architecture or a stale
+driver/compiler fingerprint is ignored. Unknown Intel GPUs (this machine's integrated Arc, id `0x7D55`) take the
+safe path. `log_choice_once` prints the chosen implementation and reason once per configuration.
+
+**W0.** The prefill phase table now charges `qsa score` and `qsa topk` separately (the historical `qsa select`
+name is kept but is 0 on the new path). `bench/sycl-prefill/run_suite.sh` validates exit status, the final timing
+fields and the token count and archives rejected runs; `summarize.py` reports counts/medians/ranges. See
+`bench/sycl-perf-v2/BASELINE.md`.
+
+**W1 exact hierarchical top-k.** Above the register selector's 33,792-block capacity, `qsa_block_topk_hier`
+runs four 8-bit radix passes with per-tile (1,024-block) histograms, a per-query threshold reduction and ordered
+compaction — the same weighted-cell selection (4 cells per complete block, the tail block's own weight), lowest-ID
+ties and ascending output as the reference. All buffers are caller-owned workspace, so a captured graph replays
+with no allocation. On B70 at 262,144 context it is **7.4×/5.3×/3.7× faster than the reference for 1/4/8 queries**
+(identical ids, 12 reps) and **slower for ≥64 queries**, so `auto` enables it only for few queries beyond the
+capacity (the decode path); prefill batches keep the established selector. A770 has no measurement, so it keeps
+the reference fallback.
+
+**W2 tiled shared-key FP32 scoring.** `block_scores_tiled_kernel` gives a workgroup eight queries and reuses each
+key row across them in one launch, supporting the active bound and any query count. Its arithmetic is
+byte-for-byte the reference (same lane-local dot, 16-step xor reduction, per-head ReLU then sum, tail `+1e9`),
+verified bitwise across query counts 1–256, active and captured modes, varying `n_bid` and incomplete tails.
+Measured 1.52×/1.20×/1.22× faster at 8/64/256 queries on B70 (262,144 context). It is enabled by default on B70;
+A770 keeps the legacy scorer until it is measured. At 8K decode the end-to-end result is unchanged (17.33 →
+17.34/17.36 tok/s).
+
+**Controls.** `STRATA_SYCL_TOPK=reference|legacy|hierarchical|auto`,
+`STRATA_SYCL_SCORES=legacy|tiled|xmx|auto`, `STRATA_SYCL_DISPATCH_QUIET=1`. Overrides are parsed once at load
+(never during capture); an unknown value or an unsupported forced kernel fails clearly. XMX scoring/attention/
+experts remain off: no compiled, application-validated matrix kernel exists, so requesting `xmx` is rejected
+rather than silently running a precision-changing path.
+
+**Build portability.** A separate dg2-g10 AOT build (`build-sycl-dg2`) links `libstrata_sycl_kernels_base.so`
+with the new kernels; no Battlemage-specific matrix template is compiled into the A770 image. `STRATA_SYCL_AOT_DEVICES`
+accepts a comma-separated list for a combined distribution.
+
+**Not done yet.** Prompt-attention tiling (W3), device expert grouping (W4), bounded/fused expert products (W5),
+measured chunk selection (W6) and the decode/host sweep (W7) are not implemented; their selector vocabulary
+exists but no `auto` path uses them. A770 runtime qualification is pending hardware.

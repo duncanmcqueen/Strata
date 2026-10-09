@@ -168,6 +168,24 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
     return keep;
 }
 
+/// The mirror for a lend region at the START of the cache: returns one past the last slot kept in RAM ([0, keep_to)),
+/// walking from slot 0 up to `lend_to`, or -1 when `base_bytes` alone exceeds `budget`.
+int64_t choose_resident_keep_to(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
+                                int64_t lend_to) {
+    if (base_bytes > budget) return -1;
+    const int64_t slots = (int64_t) slot_bytes.size();
+    if (lend_to < 0 || lend_to > slots) lend_to = slots;
+    int64_t keep = 0;
+    uint64_t bytes = base_bytes;
+    while (keep < lend_to) {
+        const uint64_t b = slot_bytes[(size_t) keep];
+        if (b > budget - bytes) break;
+        bytes += b;
+        ++keep;
+    }
+    return keep;
+}
+
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
     if (in == out || in >= offsets.size() || out >= offsets.size() || offsets[in] == kNoCacheComplement ||
         offsets[out] != kNoCacheComplement) return false;
@@ -1203,7 +1221,8 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+    int64_t lend_to_slot) {
     err.clear();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -1310,7 +1329,8 @@ bool FileExpertSource::pin_cache_complement(
         lend_from_slot = -1;
     }
 
-    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
+    const int64_t lend_to = lend_to_slot >= 0 ? std::min<int64_t>(lend_to_slot, n_slots) : n_slots;
+    const bool lend = lend_from_slot >= 0 && lend_from_slot < lend_to && additional_gpu_pairs.empty();
     uint64_t budget = std::numeric_limits<uint64_t>::max();
     if (bytes > 0 || lend) {
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
@@ -1333,19 +1353,34 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
     // The prompt path's lend region: its slots' experts are streamed from here during a prompt and copied back into
-    // their slots after it, so the ones that fit are kept here too (from the last slot down: a short prompt lends
-    // only the last few).  The rest keep the mapped-file fallback.
-    int64_t keep_from = n_slots;
+    // their slots after it, so the ones that fit are kept here too.  The region is [lend_from_slot, lend_to) - the
+    // cache's last few slots by default, or its FIRST slots on SYCL (low GEMM operand offsets, see blas.cpp).  The
+    // rest keep the mapped-file fallback.  `kept_slots` is how many of the region's slots ended up in RAM.
+    int64_t kept_slots = 0;
     if (lend) {
-        keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
-        if (keep_from < 0) keep_from = n_slots;
-        if (keep_from < n_slots) {
-            std::vector<std::pair<int32_t, int32_t>> core;
-            core.reserve(primary_gpu_pairs.size());
+        if (lend_from_slot == 0 && lend_to < n_slots) {
+            // head region [0, lend_to): walk up from slot 0; the complement is built for the slots ABOVE `keep_to`
+            const int64_t keep_to = detail::choose_resident_keep_to(slot_bytes, bytes, budget, lend_to);
+            const int64_t kept = keep_to < 0 ? 0 : keep_to;
+            std::vector<std::pair<int32_t, int32_t>> above;
+            above.reserve(primary_gpu_pairs.size());
             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
-                if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
-            if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
+                if (pair_slot[i] >= kept) above.push_back(primary_gpu_pairs[i]);
+            if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, above,
                                                     additional_gpu_pairs, offsets, bytes, err)) return false;
+            kept_slots = kept;
+        } else {
+            int64_t keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
+            if (keep_from < 0) keep_from = n_slots;
+            if (keep_from < n_slots) {
+                std::vector<std::pair<int32_t, int32_t>> core;
+                core.reserve(primary_gpu_pairs.size());
+                for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
+                    if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
+                if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
+                                                        additional_gpu_pairs, offsets, bytes, err)) return false;
+            }
+            kept_slots = n_slots - keep_from;
         }
     }
 
@@ -1591,7 +1626,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_partial_ = !pinned_ok && partial_pin > 0;
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
-    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    complement_lent_slots_ = lend ? kept_slots : 0;
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
@@ -1599,8 +1634,8 @@ bool FileExpertSource::pin_cache_complement(
                  note.empty() ? "" : "; ", note.c_str());
     if (lend)
         std::fprintf(stderr, "FileExpertSource: %lld of the prompt path's %lld lendable slots keep their experts in RAM "
-                             "too%s\n", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
-                     complement_lent_slots_ < n_slots - lend_from_slot
+                             "too%s\n", (long long) complement_lent_slots_, (long long) (lend_to - lend_from_slot),
+                     complement_lent_slots_ < lend_to - lend_from_slot
                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
     if (!additional_gpu_pairs.empty()) {
         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",

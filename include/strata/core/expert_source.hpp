@@ -85,6 +85,9 @@ const uint8_t* cache_complement_blob_or_fallback(
 /// first slot kept in RAM (`slot_bytes.size()` = none), or -1 when `base_bytes` alone exceeds `budget`.
 int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
                                   int64_t lend_from);
+/// Head-loan counterpart: keep [0, return value), stopping at lend_to or the RAM budget.
+int64_t choose_resident_keep_to(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
+                                int64_t lend_to);
 
 /// The adaptive tier swapped `in` into a GPU slot and `out` out of it: `out` takes `in`'s place in the compact copy
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
@@ -417,8 +420,9 @@ public:
     ///     window may read a share of the misses over PCIe; when the driver refuses, ordinary memory locked in the
     ///     working set instead.  `pin = false` is ordinary pageable memory (the ROCm arm: large pinned allocations
     ///     can fail there, and it is what the HIP measurements used).
-    ///   - `lend_from_slot` >= 0: the GPU-cache slots from there to the end are the prompt path's lend region; their
-    ///     experts are kept in RAM too, from the last slot down, as far as `available RAM - headroom_bytes` allows
+    ///   - `lend_from_slot` >= 0: [lend_from_slot, lend_to_slot) is the loan (negative end means cache end).
+    ///     Supported loans are a prefix or suffix. Prefix experts are kept from slot 0 upward; suffix experts
+    ///     from the last slot downward, as far as `available RAM - headroom_bytes` allows
     ///     (a lent slot's expert is streamed during the prompt and copied back after it).
     ///   - the rest (the experts no slot holds) must fit that budget, or nothing is allocated and this returns false.
     ///
@@ -433,7 +437,7 @@ public:
         const ExpertCache& cache, std::string& err, bool pin = true,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
-        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr, int64_t lend_to_slot = -1);
     void close();
 
     bool mapped() const { return base_ != nullptr; }

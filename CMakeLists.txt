@@ -174,6 +174,9 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  add_executable(prefill_cache_loan_test tests/core/prefill_cache_loan_test.cpp)
+  target_include_directories(prefill_cache_loan_test PRIVATE include)
+  add_test(NAME prefill_cache_loan_test COMMAND prefill_cache_loan_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
@@ -1166,6 +1169,12 @@ if(STRATA_ENABLE_SYCL)
   target_link_libraries(sycl_qsa_select_bench PRIVATE strata_sycl_kernels)
   add_test(NAME sycl_qsa_select_bench COMMAND sycl_qsa_select_bench 32768 256 1 262144)
 
+  # section 1A dispatch: pure synthetic-profile unit tests (no GPU). Built on every SYCL configuration, so an
+  # A770-only machine checks its own selectors without owning a B70.
+  add_executable(sycl_device_profile_test tests/sycl/device_profile_test.cpp)
+  target_link_libraries(sycl_device_profile_test PRIVATE strata_sycl_runtime)
+  add_test(NAME sycl_device_profile_test COMMAND sycl_device_profile_test)
+
   # the i-quant kernels: decode-once vs per-column bitwise, and the grouped native experts' group stride and fused
   # SwiGLU + q8_1 vs v1 bitwise (the CUDA/HIP tests unchanged; synthetic, no model)
   foreach(_iq iq_multi native_grouped mmvq_multi)
@@ -1228,6 +1237,13 @@ if(STRATA_ENABLE_SYCL)
   add_executable(sycl_gemm_4g tests/sycl/gemm_4g.cpp)
   target_link_libraries(sycl_gemm_4g PRIVATE strata_sycl_kernels)
   add_test(NAME sycl_gemm_4g COMMAND sycl_gemm_4g)
+  # joint_matrix capability probe: FP16/BF16 16x16x16 and INT8 8x16x32 products against an independent reference,
+  # linked against the ported kernel libraries (so it runs through the same runtime).  SKIP (77) if nothing launches.
+  add_executable(sycl_matrix_probe tests/sycl/matrix_probe.cpp)
+  target_link_libraries(sycl_matrix_probe PRIVATE strata_sycl_kernels)
+  add_test(NAME sycl_matrix_probe COMMAND sycl_matrix_probe --linked)
+  add_test(NAME sycl_matrix_oracle_test COMMAND sycl_matrix_probe --oracle-selftest)
+  set_tests_properties(sycl_matrix_probe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # Q6_K in the reordered layout (native_mmvq.hpp) bitwise against the GGUF blocks: the GEMV and the dequantize
   add_executable(sycl_q6k_reorder tests/sycl/q6k_reorder.cpp)
   target_link_libraries(sycl_q6k_reorder PRIVATE strata_sycl_kernels)

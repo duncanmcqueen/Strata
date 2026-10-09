@@ -1,0 +1,16 @@
+f-short-base-1|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+f-short-head-1|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64|
+f-short-base-2|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+f-short-head-2|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64|
+f-short-base-3|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+f-short-head-3|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64|
+f-nr8k-base-1|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+f-nr8k-head-1|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+f-nr8k-base-2|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+f-nr8k-head-2|bench/sycl-prefill/artifacts/prompt_nr8k.ids|auto:8192|MAX_CONTEXT=16384 MAX_NEW=64|
+f-nr32k-base-1|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+f-nr32k-head-1|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+f-nr32k-base-2|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+f-nr32k-head-2|bench/sycl-prefill/artifacts/prompt_nr32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+f-261k-base-1|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+f-261k-head-1|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64|

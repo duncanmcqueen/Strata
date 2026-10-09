@@ -77,6 +77,7 @@ add_library(strata_sycl_runtime SHARED
   src/sycl_runtime/runtime.cpp
   src/sycl_runtime/memory.cpp
   src/sycl_runtime/graph.cpp
+  src/sycl_runtime/device_profile.cpp
   src/sycl_runtime/blas.cpp)
 target_include_directories(strata_sycl_runtime BEFORE PUBLIC
   "${STRATA_SYCL_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -88,6 +89,15 @@ file(TO_CMAKE_PATH "${STRATA_SYCL_COMPAT_INCLUDE_DIR}/cuda_runtime.h" _strata_sy
 target_compile_options(strata_sycl_runtime PUBLIC
   "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${_strata_sycl_force}>")
 target_link_libraries(strata_sycl_runtime PUBLIC strata_sycl_flags MKL::MKL_SYCL)
+# Which device-specific kernel families this build actually compiles.  The dispatch profile reads these so the
+# selectors never advertise a kernel that is not in the binary.  XMX families stay unset (off) until a kernel is
+# implemented AND qualified; the A770 build must never inherit a B70-only template.
+target_compile_definitions(strata_sycl_runtime PRIVATE
+  STRATA_SYCL_HAVE_TOPK_HIER=1
+  STRATA_SYCL_HAVE_SCORES_TILED=1
+  STRATA_SYCL_HAVE_PROMPT_ATTN_TILED=0
+  STRATA_SYCL_HAVE_GROUPING_DEVICE=0
+  STRATA_SYCL_HAVE_EXPERTS_BOUNDED=0)
 
 # The SYCL build is incremental: the engine (strata_core, prefill, generate) stays
 # CUDA/HIP-only until its sources are ported; what exists at each step is the runtime

@@ -1,0 +1,2 @@
+diag-8k-nostage|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=4 STRATA_PREFILL_TIMING=1 STRATA_SYCL_GEMM_NO_STAGE=1|
+diag-8k-qstats|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=4 STRATA_PREFILL_TIMING=1 STRATA_SYCL_QSTATS=1|

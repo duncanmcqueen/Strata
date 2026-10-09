@@ -1,0 +1,3 @@
+noborrow-32k-c8192|bench/sycl-prefill/artifacts/prompt32k.ids|8192|MAX_CONTEXT=65536 MAX_NEW=4 STRATA_PREFILL_TIMING=1|--no-prefill-borrow
+noborrow-32k-c32768|bench/sycl-prefill/artifacts/prompt32k.ids|32768|MAX_CONTEXT=65536 MAX_NEW=4 STRATA_PREFILL_TIMING=1|--no-prefill-borrow
+noborrow-261k-c8192|bench/sycl-prefill/artifacts/prompt261k.ids|8192|MAX_CONTEXT=262144 MAX_NEW=4 STRATA_PREFILL_TIMING=1|--no-prefill-borrow

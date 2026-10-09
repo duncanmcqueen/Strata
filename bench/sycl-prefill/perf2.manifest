@@ -1,0 +1,20 @@
+p2-8k-base-1|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-8k-own-1|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=64|
+p2-8k-base-2|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-8k-own-2|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=64|
+p2-8k-base-3|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-8k-own-3|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=64|
+p2-32k-base-1|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-32k-own-1|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+p2-32k-base-2|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-32k-own-2|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+p2-32k-base-3|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-32k-own-3|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64|
+p2-short-base-1|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-short-own-1|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64|
+p2-short-base-2|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-short-own-2|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64|
+p2-short-base-3|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-short-own-3|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64|
+p2-261k-base-1|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64 STRATA_SYCL_PREFILL_BORROW=1 STRATA_PREFILL_LEND_TAIL=1|
+p2-261k-own-1|bench/sycl-prefill/artifacts/prompt261k.ids|auto:8192|MAX_CONTEXT=262144 MAX_NEW=64|

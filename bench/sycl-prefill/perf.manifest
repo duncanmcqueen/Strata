@@ -1,0 +1,20 @@
+perf-8k-tail-1|bench/sycl-prefill/artifacts/prompt8k2.ids|8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-8k-first-1|bench/sycl-prefill/artifacts/prompt8k2.ids|8192|MAX_CONTEXT=16384 MAX_NEW=64|
+perf-8k-tail-2|bench/sycl-prefill/artifacts/prompt8k2.ids|8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-8k-first-2|bench/sycl-prefill/artifacts/prompt8k2.ids|8192|MAX_CONTEXT=16384 MAX_NEW=64|
+perf-8k-tail-3|bench/sycl-prefill/artifacts/prompt8k2.ids|8192|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-8k-first-3|bench/sycl-prefill/artifacts/prompt8k2.ids|8192|MAX_CONTEXT=16384 MAX_NEW=64|
+perf-32k-tail-1|bench/sycl-prefill/artifacts/prompt32k.ids|8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-32k-first-1|bench/sycl-prefill/artifacts/prompt32k.ids|8192|MAX_CONTEXT=65536 MAX_NEW=64|
+perf-32k-tail-2|bench/sycl-prefill/artifacts/prompt32k.ids|8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-32k-first-2|bench/sycl-prefill/artifacts/prompt32k.ids|8192|MAX_CONTEXT=65536 MAX_NEW=64|
+perf-32k-tail-3|bench/sycl-prefill/artifacts/prompt32k.ids|8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-32k-first-3|bench/sycl-prefill/artifacts/prompt32k.ids|8192|MAX_CONTEXT=65536 MAX_NEW=64|
+perf-short-tail-1|bench/sycl-prefill/artifacts/prompt_short.ids|256|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-short-first-1|bench/sycl-prefill/artifacts/prompt_short.ids|256|MAX_CONTEXT=8192 MAX_NEW=64|
+perf-short-tail-2|bench/sycl-prefill/artifacts/prompt_short.ids|256|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-short-first-2|bench/sycl-prefill/artifacts/prompt_short.ids|256|MAX_CONTEXT=8192 MAX_NEW=64|
+perf-short-tail-3|bench/sycl-prefill/artifacts/prompt_short.ids|256|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-short-first-3|bench/sycl-prefill/artifacts/prompt_short.ids|256|MAX_CONTEXT=8192 MAX_NEW=64|
+perf-261k-tail-1|bench/sycl-prefill/artifacts/prompt261k.ids|8192|MAX_CONTEXT=262144 MAX_NEW=64 STRATA_PREFILL_LEND_TAIL=1|
+perf-261k-first-1|bench/sycl-prefill/artifacts/prompt261k.ids|8192|MAX_CONTEXT=262144 MAX_NEW=64|

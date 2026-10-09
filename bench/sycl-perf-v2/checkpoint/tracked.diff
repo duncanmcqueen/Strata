@@ -1,0 +1,663 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cd6bdc0..041586c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -174,6 +174,9 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
+ # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
+ target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
+ if(STRATA_BUILD_TESTS)
++  add_executable(prefill_cache_loan_test tests/core/prefill_cache_loan_test.cpp)
++  target_include_directories(prefill_cache_loan_test PRIVATE include)
++  add_test(NAME prefill_cache_loan_test COMMAND prefill_cache_loan_test)
+   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
+   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
+   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
+@@ -1228,6 +1231,13 @@ if(STRATA_ENABLE_SYCL)
+   add_executable(sycl_gemm_4g tests/sycl/gemm_4g.cpp)
+   target_link_libraries(sycl_gemm_4g PRIVATE strata_sycl_kernels)
+   add_test(NAME sycl_gemm_4g COMMAND sycl_gemm_4g)
++  # joint_matrix capability probe: FP16/BF16 16x16x16 and INT8 8x16x32 products against an independent reference,
++  # linked against the ported kernel libraries (so it runs through the same runtime).  SKIP (77) if nothing launches.
++  add_executable(sycl_matrix_probe tests/sycl/matrix_probe.cpp)
++  target_link_libraries(sycl_matrix_probe PRIVATE strata_sycl_kernels)
++  add_test(NAME sycl_matrix_probe COMMAND sycl_matrix_probe --linked)
++  add_test(NAME sycl_matrix_oracle_test COMMAND sycl_matrix_probe --oracle-selftest)
++  set_tests_properties(sycl_matrix_probe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+   # Q6_K in the reordered layout (native_mmvq.hpp) bitwise against the GGUF blocks: the GEMV and the dequantize
+   add_executable(sycl_q6k_reorder tests/sycl/q6k_reorder.cpp)
+   target_link_libraries(sycl_q6k_reorder PRIVATE strata_sycl_kernels)
+diff --git a/docs/INTEL_SYCL.md b/docs/INTEL_SYCL.md
+index 38ab272..b35c20f 100644
+--- a/docs/INTEL_SYCL.md
++++ b/docs/INTEL_SYCL.md
+@@ -229,6 +229,48 @@ The xe driver kills a GPU job that runs longer than its job timeout (`job_timeou
+ waits last as long as the CPU pool: with the experts on disk instead of in RAM (`--mmap-experts` after a long prompt
+ evicted the page cache) a first window ran past it and the engine was reset.  The RAM tier keeps the pool short.
+ 
++### Prefill buffer placement and the >4 GiB GEMM workaround
++
++Historical B70 runs (2026-10-06, Coder native pack, INT8 KV, resident experts) showed that
++borrowing prefill buffers from low cache offsets substantially reduced time spent on the
++protected GEMM path. Repeated 8K/32K prompts improved from median final prefill times
++20,998.5/75,929.0 ms to 10,258.9/34,841.9 ms (three runs each). These numbers precede the
++review fixes; they are not measurements of the corrected persistent-server path.
++
++On SYCL, generation and the persistent server now borrow the cache's first slots.
++`STRATA_PREFILL_LEND_TAIL=1` selects the old tail policy. The selected range is sized using
++actual slot offsets, so native packs with variable-sized slots are supported. Resident RAM
++pinning follows that range; requests mark and restore only slots in their actual loan.
++Other backends continue to borrow the tail.
++
++Low offsets reduce staging but large loans can still cross 4 GiB. The BLAS workaround and
++small-output repeatability protection remain enabled. `STRATA_SYCL_GEMM_STAGE_STATS=1`
++reports copy counts/bytes and host submission time; it does not measure device copy duration.
++The initial byte counter overcounted output copies, so its published traffic and inferred
++copy-time estimates have been withdrawn pending a corrected GPU run.
++
++The saved 8K head/tail residual samples are byte-identical. Long-context and non-repeated
++candidate timings have only one saved repetition each, and the short-prompt median came
++from an earlier variant. The complete regression gates and repeated-server validation
++remain pending. See `bench/sycl-prefill/REPORT.md` and `REVIEW_FIXES.md` in that directory
++for evidence, limitations and required reruns.
++
++`--no-prefill-borrow --prefill 8192` remains an opt-in alternative with its own allocation.
++Historical single runs were fast, but its additional reserve reduced the expert cache and
++regressed long-context continuation decode by about 10%; it is not the default.
++
++### The matrix extension on the B70
++
++`tests/sycl/matrix_probe.cpp` (linked against the kernel libraries) is the capability gate.  On
++bmg-g31 with DPC++ 2026.0, FP16 and BF16 `joint_matrix` 16x16x16 (FP32 accumulate) and INT8
++`joint_matrix` **8x16x32** (INT32 accumulate) are exact against an independent reference, with ragged
++(zero-padded guard regions) shapes and multiple work-items.  INT8 `16x16x16` is rejected at AOT time
++("unsupported number of rows/columns" and undefined `OpJointMatrix...INTEL` builtins).  The probe also
++shows the two traps for a tiled kernel: tiled M/N stores need the *padded* stride, and every tile load
++must stay inside a sized guard region.  A full XMX expert kernel was not pursued in this iteration. The probe kernel is in the
++test translation unit; linking the libraries does not establish in-library integration.
++The floating-point oracle now rejects nonfinite results and includes NaN/Inf negative controls.
++
+ ### The per-layer handoff over the link
+ 
+ Measured with `STRATA_VERIFY_LAYER_MS=1` and a standalone model of the handoff (one graph of 48 layers and a host
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 4c4d12f..da326d7 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -85,6 +85,9 @@ const uint8_t* cache_complement_blob_or_fallback(
+ /// first slot kept in RAM (`slot_bytes.size()` = none), or -1 when `base_bytes` alone exceeds `budget`.
+ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
+                                   int64_t lend_from);
++/// Head-loan counterpart: keep [0, return value), stopping at lend_to or the RAM budget.
++int64_t choose_resident_keep_to(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
++                                int64_t lend_to);
+ 
+ /// The adaptive tier swapped `in` into a GPU slot and `out` out of it: `out` takes `in`'s place in the compact copy
+ /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
+@@ -417,8 +420,9 @@ public:
+     ///     window may read a share of the misses over PCIe; when the driver refuses, ordinary memory locked in the
+     ///     working set instead.  `pin = false` is ordinary pageable memory (the ROCm arm: large pinned allocations
+     ///     can fail there, and it is what the HIP measurements used).
+-    ///   - `lend_from_slot` >= 0: the GPU-cache slots from there to the end are the prompt path's lend region; their
+-    ///     experts are kept in RAM too, from the last slot down, as far as `available RAM - headroom_bytes` allows
++    ///   - `lend_from_slot` >= 0: [lend_from_slot, lend_to_slot) is the loan (negative end means cache end).
++    ///     Supported loans are a prefix or suffix. Prefix experts are kept from slot 0 upward; suffix experts
++    ///     from the last slot downward, as far as `available RAM - headroom_bytes` allows
+     ///     (a lent slot's expert is streamed during the prompt and copied back after it).
+     ///   - the rest (the experts no slot holds) must fit that budget, or nothing is allocated and this returns false.
+     ///
+@@ -433,7 +437,7 @@ public:
+         const ExpertCache& cache, std::string& err, bool pin = true,
+         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
+         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
+-        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
++        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr, int64_t lend_to_slot = -1);
+     void close();
+ 
+     bool mapped() const { return base_ != nullptr; }
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 038e0dd..7d0d38d 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -34,6 +34,9 @@ struct PrefillStats {
+     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
+     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
+     double ms_ple = 0;
++    double ms_expert_host = 0;      ///< (STRATA_PREFILL_TIMING) host wall inside the FP16 fallback's per-expert product
++    int64_t expert_products = 0;    ///< (STRATA_PREFILL_TIMING) per-expert dequant+GEMM invocations
++    int64_t gemm_calls = 0;         ///< (STRATA_PREFILL_TIMING) m.gemm.f16 calls (2 per fallback expert product)
+ };
+ 
+ }  // namespace strata::prefill
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 91b2ded..a49ad97 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -168,6 +168,24 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
+     return keep;
+ }
+ 
++/// The mirror for a lend region at the START of the cache: returns one past the last slot kept in RAM ([0, keep_to)),
++/// walking from slot 0 up to `lend_to`, or -1 when `base_bytes` alone exceeds `budget`.
++int64_t choose_resident_keep_to(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
++                                int64_t lend_to) {
++    if (base_bytes > budget) return -1;
++    const int64_t slots = (int64_t) slot_bytes.size();
++    if (lend_to < 0 || lend_to > slots) lend_to = slots;
++    int64_t keep = 0;
++    uint64_t bytes = base_bytes;
++    while (keep < lend_to) {
++        const uint64_t b = slot_bytes[(size_t) keep];
++        if (b > budget - bytes) break;
++        bytes += b;
++        ++keep;
++    }
++    return keep;
++}
++
+ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
+     if (in == out || in >= offsets.size() || out >= offsets.size() || offsets[in] == kNoCacheComplement ||
+         offsets[out] != kNoCacheComplement) return false;
+@@ -1203,7 +1221,8 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
+ bool FileExpertSource::pin_cache_complement(
+     const ExpertCache& cache, std::string& err, bool pin,
+     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
+-    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
++    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
++    int64_t lend_to_slot) {
+     err.clear();
+     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
+     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
+@@ -1310,7 +1329,8 @@ bool FileExpertSource::pin_cache_complement(
+         lend_from_slot = -1;
+     }
+ 
+-    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
++    const int64_t lend_to = lend_to_slot >= 0 ? std::min<int64_t>(lend_to_slot, n_slots) : n_slots;
++    const bool lend = lend_from_slot >= 0 && lend_from_slot < lend_to && additional_gpu_pairs.empty();
+     uint64_t budget = std::numeric_limits<uint64_t>::max();
+     if (bytes > 0 || lend) {
+         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
+@@ -1333,19 +1353,34 @@ bool FileExpertSource::pin_cache_complement(
+         }
+     }
+     // The prompt path's lend region: its slots' experts are streamed from here during a prompt and copied back into
+-    // their slots after it, so the ones that fit are kept here too (from the last slot down: a short prompt lends
+-    // only the last few).  The rest keep the mapped-file fallback.
+-    int64_t keep_from = n_slots;
++    // their slots after it, so the ones that fit are kept here too.  The region is [lend_from_slot, lend_to) - the
++    // cache's last few slots by default, or its FIRST slots on SYCL (low GEMM operand offsets, see blas.cpp).  The
++    // rest keep the mapped-file fallback.  `kept_slots` is how many of the region's slots ended up in RAM.
++    int64_t kept_slots = 0;
+     if (lend) {
+-        keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
+-        if (keep_from < 0) keep_from = n_slots;
+-        if (keep_from < n_slots) {
+-            std::vector<std::pair<int32_t, int32_t>> core;
+-            core.reserve(primary_gpu_pairs.size());
++        if (lend_from_slot == 0 && lend_to < n_slots) {
++            // head region [0, lend_to): walk up from slot 0; the complement is built for the slots ABOVE `keep_to`
++            const int64_t keep_to = detail::choose_resident_keep_to(slot_bytes, bytes, budget, lend_to);
++            const int64_t kept = keep_to < 0 ? 0 : keep_to;
++            std::vector<std::pair<int32_t, int32_t>> above;
++            above.reserve(primary_gpu_pairs.size());
+             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
+-                if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
+-            if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
++                if (pair_slot[i] >= kept) above.push_back(primary_gpu_pairs[i]);
++            if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, above,
+                                                     additional_gpu_pairs, offsets, bytes, err)) return false;
++            kept_slots = kept;
++        } else {
++            int64_t keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
++            if (keep_from < 0) keep_from = n_slots;
++            if (keep_from < n_slots) {
++                std::vector<std::pair<int32_t, int32_t>> core;
++                core.reserve(primary_gpu_pairs.size());
++                for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
++                    if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
++                if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
++                                                        additional_gpu_pairs, offsets, bytes, err)) return false;
++            }
++            kept_slots = n_slots - keep_from;
+         }
+     }
+ 
+@@ -1591,7 +1626,7 @@ bool FileExpertSource::pin_cache_complement(
+     complement_partial_ = !pinned_ok && partial_pin > 0;
+     complement_locked_ = locked;
+     complement_lock_off_ = lock_off;
+-    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
++    complement_lent_slots_ = lend ? kept_slots : 0;
+     complement_ready_ = true;
+     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB%s%s\n",
+                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
+@@ -1599,8 +1634,8 @@ bool FileExpertSource::pin_cache_complement(
+                  note.empty() ? "" : "; ", note.c_str());
+     if (lend)
+         std::fprintf(stderr, "FileExpertSource: %lld of the prompt path's %lld lendable slots keep their experts in RAM "
+-                             "too%s\n", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
+-                     complement_lent_slots_ < n_slots - lend_from_slot
++                             "too%s\n", (long long) complement_lent_slots_, (long long) (lend_to - lend_from_slot),
++                     complement_lent_slots_ < lend_to - lend_from_slot
+                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
+     if (!additional_gpu_pairs.empty()) {
+         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 5d46e4b..10a6f3b 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -2460,6 +2460,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+                                 return true;
+                             }
+                             const int q = (int) (j % DQ);
++                            static const bool pf_host = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
++                            const auto thost = pf_host ? Clock::now() : Clock::time_point{};
+                             if (lay.native) {
+                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
+                                 const auto& f = lay.fmt[(size_t) l];
+@@ -2476,6 +2478,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                             pt.mark(kPfGemmD, cs);
+                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
++                            if (pf_host) {   // P0: host time in the per-expert product, to separate host dispatch from GPU work
++                                stats_.ms_expert_host += ms_since(thost);
++                                ++stats_.expert_products;
++                                stats_.gemm_calls += 2;
++                            }
+                             return true;
+                         };
+                         if (!stream_all) {
+@@ -2688,6 +2695,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
+                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
+                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
++        if (stats_.expert_products > 0)
++            std::fprintf(stderr, "strata prefill timing: expert products %lld (%.0f ms host total, %.3f ms host each), %lld GEMMs\n",
++                         (long long) stats_.expert_products, stats_.ms_expert_host,
++                         stats_.ms_expert_host / (double) stats_.expert_products, (long long) stats_.gemm_calls);
+         if (pe.on) {
+             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
+             std::string pl;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3712603..c1eb485 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "strata/core/device.hpp"
+ #include "strata/core/expert_cache.hpp"
++#include "strata/prefill/cache_loan.hpp"
+ #include "strata/core/conversation_snapshot.hpp"
+ #include "strata/core/conversation_memory.hpp"
+ #include "strata/core/coupled_draft.hpp"
+@@ -3989,8 +3990,7 @@ int main(int argc, char** argv) {
+     // from the live session or the longest conversation checkpoint its prompt starts with (see ConvCheckpoint),
+     // otherwise from an empty sequence (`session_zero`); the rest of the prompt goes through the batched prompt path
+     // and its last token through the first verify window - the path all three model files share.  Decoding is greedy.
+-    // The expert-cache slots (from the end of the cache) that hold the prompt path's buffers for a chunk, and the
+-    // bytes from the first of them to the end.
++    // The expert-cache range holding prompt buffers is shared by the pinning and execution plans.
+     // the share of expert bytes the arena could pin (sizes the prompt path's streamed ring and its lend cap)
+     if (srcp != nullptr && o.prefill_chunk > 0) {
+         uint64_t pinned = 0, total = 0;
+@@ -4003,16 +4003,23 @@ int main(int argc, char** argv) {
+             }
+         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
+     }
++    // One range policy for resident pinning, generation and persistent-server loans.
++    const bool lend_head = [] {
++#if defined(STRATA_USE_SYCL)
++        return std::getenv("STRATA_PREFILL_LEND_TAIL") == nullptr;
++#else
++        return false;
++#endif
++    }();
++    auto cache_loan = [&](const strata::core::ExpertCache& cache, uint64_t need) {
++        return strata::prefill::cache_loan(cache.slots(), cache.slot_offsets(),
++            strata::kernels::cpu::expert_layout().max_blob, need, lend_head);
++    };
+     auto lend_slots = [&](int64_t c) -> int64_t {
+-        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+-        int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+-        if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
+-            k = 0;
+-            while (k < xcache.slots() &&
+-                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+-        }
+-        return k;
++        return cache_loan(xcache, strata::prefill::Prefill::bytes_needed(g, ss, c)).count();
++    };
++    auto lend_first_slot = [&](int64_t k) -> int32_t {
++        return lend_head ? 0 : (int32_t) (xcache.slots() - k);
+     };
+     // `lend_bytes` went with the single-cache serve loan: a participant's loan is priced by `part_bytes` from its
+     // OWN cache, and the only other user of the old helper was the serve path's own relayout.
+@@ -4061,19 +4068,23 @@ int main(int argc, char** argv) {
+     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
+     // hold are copied from experts.bin into RAM once, so no decode or prompt step reads the file (the plain mmap
+     // mode reads them through the OS file cache, which a small-RAM PC keeps giving back to the SSD).  Built here,
+-    // after the prompt path's lend plan is known: the slots it may lend (the cache's last ones) have their experts
++    // after the prompt path's lend plan is known: the selected head or tail slots have their experts
+     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
+     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
+     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
+     if (o.resident_cpu_experts) {
+         int64_t lend_from = -1;
++        int64_t lend_to = -1;
+         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
+             int64_t chunk = o.prefill_chunk;
+             const int64_t k = plan_lend(chunk);
+-            if (k > 0) lend_from = xcache.slots() - k;
++            if (k > 0) {
++                lend_from = lend_first_slot(k);       // SYCL: the cache's first slots (see lend_first_slot)
++                lend_to = lend_from + k;
++            }
+         }
+         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
+-                                                    o.resident_budget, &profile);
++                                                    o.resident_budget, &profile, lend_to);
+         std::string whole_err;
+         if (!resident_ok && o.resident_soft) {
+             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
+@@ -4131,8 +4142,8 @@ int main(int argc, char** argv) {
+         uint64_t borrow_bytes = 0;
+         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
+         // ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (layers [0, split_at[0]),
+-        // which is the whole model without a split) borrowing the tail of CUDA0's cache, then one per stage
+-        // borrowing the tail of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the
++        // which is the whole model without a split) borrowing a range of CUDA0's cache, then one per stage
++        // borrowing a range of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the
+         // chunk, is laid out by `Prefill::relayout`, and is refilled before any window reads - so outside the
+         // prompt the whole cache is expert cache.  THIS IS THE POINT OF THE STRUCT: the loan used to exist only
+         // for CUDA0, and `no_prefill_borrow` made every stage instead withhold a chunk-sized reserve from its
+@@ -4151,23 +4162,14 @@ int main(int argc, char** argv) {
+             int64_t lent_chunk = 0;
+             std::vector<std::pair<int32_t, int32_t>> lent;
+         };
++        auto part_loan = [&](const PfPart& p, int64_t c) {
++            return cache_loan(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c));
++        };
+         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
+-            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
+-            strata::core::ExpertCache& xc = *p.cache;
+-            if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
+-                int64_t k = 0;
+-                while (k < xc.slots() &&
+-                       (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
+-                return k;
+-            }
+-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+-            return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
++            return part_loan(p, c).count();
+         };
+-        auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
+-            strata::core::ExpertCache& xc = *p.cache;
+-            return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
+-                                     : (uint64_t) (xc.slots() - first) *
+-                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
++        auto part_bytes = [&](const PfPart& p, int64_t c) -> uint64_t {
++            return part_loan(p, c).bytes;
+         };
+         // #340: a layer split whose caches already hold most experts streams few of them through the prompt path, so
+         // the 384-slot ring (sized for a card that streams nearly every expert of a chunk) only makes every stage's
+@@ -4262,7 +4264,7 @@ int main(int argc, char** argv) {
+                                          "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
+                 o.prefill_chunk = chunk;
+                 for (PfPart& p : pf_parts) {
+-                    p.first = (int32_t) (p.cache->slots() - part_slots(p, chunk));
++                    p.first = (int32_t) part_loan(p, chunk).first;
+                     p.first_now = p.first;
+                 }
+                 // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
+@@ -4292,7 +4294,7 @@ int main(int argc, char** argv) {
+                 }
+                 lend_first = pf_parts[0].first;
+                 borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
+-                borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
++                borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], o.prefill_chunk) : 0;
+             } else if (o.prefill_auto) {
+                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
+             } else if (pf_parts.size() > 1) {
+@@ -4316,12 +4318,12 @@ int main(int argc, char** argv) {
+         if (any_loan) {
+             if (borrow != nullptr)
+                 std::fprintf(stderr, "strata serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
+-                             (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
++                             (long long) part_slots(pf_parts[0], o.prefill_chunk), (double) borrow_bytes / 1073741824.0);
+             for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
+                 if (pf_parts[i].first >= 0) std::fprintf(stderr, "strata serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
+-                             pf_parts[i].dev, (long long) (pf_parts[i].cache->slots() - pf_parts[i].first),
++                             pf_parts[i].dev, (long long) part_slots(pf_parts[i], o.prefill_chunk),
+                              (long long) pf_parts[i].cache->slots(),
+-                             (double) part_bytes(pf_parts[i], pf_parts[i].first) / 1073741824.0);
++                             (double) part_bytes(pf_parts[i], o.prefill_chunk) / 1073741824.0);
+         } else {
+             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
+         }
+@@ -4340,7 +4342,7 @@ int main(int argc, char** argv) {
+                 // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
+                 if (i + 1 < pf_parts.size() && pf_parts[i + 1].first >= 0) {
+                     sb = st.cache.device_slot(pf_parts[i + 1].first);
+-                    sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
++                    sbb = part_bytes(pf_parts[i + 1], o.prefill_chunk);
+                 }
+                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
+                                 err, sb, sbb)) {
+@@ -4413,12 +4415,12 @@ int main(int argc, char** argv) {
+                 if (any_loan) {                  // smaller loans for the smaller chunk
+                     for (PfPart& p : pf_parts)
+                         if (p.first >= 0) {
+-                            p.first = (int32_t) (p.cache->slots() - part_slots(p, next));
++                            p.first = (int32_t) part_loan(p, next).first;
+                             p.first_now = p.first;
+                         }
+                     lend_first = pf_parts[0].first;
+                     borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
+-                    borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
++                    borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], o.prefill_chunk) : 0;
+                 }
+                 err.clear();
+                 continue;
+@@ -4454,17 +4456,17 @@ int main(int argc, char** argv) {
+             int64_t evicted = 0;
+             for (PfPart& p : pf_parts) {
+                 if (S <= 0 || p.first < 0) continue;
+-                const int32_t first_s = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, S)));
++                const auto small_loan = part_loan(p, S);
+                 int64_t n = 0;
+                 for (int64_t l = p.lb; l < p.le; ++l)
+                     for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                         int32_t& r = host_res[(size_t) (l * g.n_expert + ex)];
+-                        if (r >= first_s) { r = strata::core::kNotResident; ++n; }
++                        if (small_loan.contains(r)) { r = strata::core::kNotResident; ++n; }
+                     }
+                 evicted += n;
+                 std::fprintf(stderr, "strata serve:   CUDA%d keeps %lld slots for %lld-token prompts (%lld experts "
+                                      "no longer resident)\n", p.dev < 0 ? 0 : p.dev,
+-                             (long long) (p.cache->slots() - first_s), (long long) S, (long long) n);
++                             (long long) small_loan.count(), (long long) S, (long long) n);
+             }
+             if (evicted > 0) {
+                 if (d_res != nullptr)
+@@ -5547,7 +5549,7 @@ int main(int argc, char** argv) {
+                 return true;
+             };
+             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+-            // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
++            // rounded up to 256), laid out in the selected head or tail range - per participant, out of that
+             // participant's own cache, and marking only that participant's own layers
+             auto lend = [&](int64_t tokens, std::string& e) -> bool {
+                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+@@ -5573,15 +5575,16 @@ int main(int argc, char** argv) {
+                         if (!refill_one(p, e)) return false;
+                     }
+                     const strata::core::OnDevice on(p.dev);
+-                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
++                    const auto loan = part_loan(p, want);
++                    const int32_t first = (int32_t) loan.first;
+                     if (want != p.sp->chunk() || first != p.first_now) {
+-                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
++                        if (!p.sp->relayout(want, p.cache->device_slot(first), loan.bytes, e)) return false;
+                         p.first_now = first;
+                     }
+                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
+                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                             const size_t i = (size_t) (l * g.n_expert + ex);
+-                            if (host_res[i] >= first) {
++                            if (loan.contains(host_res[i])) {
+                                 p.lent.emplace_back((int32_t) i, host_res[i]);
+                                 host_res[i] = strata::core::kNotResident;
+                                 any = true;
+@@ -6101,18 +6104,27 @@ int main(int argc, char** argv) {
+             }
+             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+             if (k > 0) {   // the lent slots are refilled after the prompt
+-                const int32_t first = (int32_t) (xcache.slots() - k);
+-                for (size_t i = 0; i < host_res.size(); ++i)
+-                    if (host_res[i] >= first) {
+-                        lent.emplace_back((int32_t) i, host_res[i]);
++                const int32_t first = lend_first_slot(k);
++                for (size_t i = 0; i < host_res.size(); ++i) {
++                    const int32_t s = host_res[i];
++                    if (s >= first && s < first + (int32_t) k) {   // kNotResident (-1) never matches
++                        lent.emplace_back((int32_t) i, s);
+                         host_res[i] = strata::core::kNotResident;
+                     }
++                }
+                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                 borrow = xcache.device_slot(first);
+-                borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
+-                                                     : (uint64_t) k * (uint64_t) blob;
+-                std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)\n", (long long) k,
+-                             (double) borrow_bytes / 1073741824.0);
++                borrow_bytes = xcache.slot_offsets()
++                                   ? (uint64_t) (xcache.slot_offsets()[first + k] - xcache.slot_offsets()[first])
++                                   : (uint64_t) k * (uint64_t) blob;
++                std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)%s\n", (long long) k,
++                             (double) borrow_bytes / 1073741824.0,
++#if defined(STRATA_USE_SYCL)
++                             first == 0 ? " at the cache's start (SYCL: low GEMM operand offsets)" : ""
++#else
++                             ""
++#endif
++                             );
+             }
+         }
+         if (borrow == nullptr)
+diff --git a/src/sycl_runtime/blas.cpp b/src/sycl_runtime/blas.cpp
+index 87670b5..7319c39 100644
+--- a/src/sycl_runtime/blas.cpp
++++ b/src/sycl_runtime/blas.cpp
+@@ -7,6 +7,9 @@
+ // combinations are the two gemm.cu actually launches - bf16 x bf16 -> f32 and
+ // f16 x f16 -> f32, both with CUBLAS_COMPUTE_32F; anything else is NOT_SUPPORTED.
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
+ #include <mutex>
+ #include <map>
+ #include <cstdlib>
+@@ -31,6 +34,26 @@ using strata::sycl_runtime::device_offset_end;
+ 
+ namespace {
+ 
++// P0 instrumentation: how often the >4 GiB operand workaround fires and how much it
++// copies.  Off unless STRATA_SYCL_GEMM_STAGE_STATS=1; reported at process exit.
++struct StageStats {
++    std::atomic<long long> calls{0}, far_a{0}, far_b{0}, far_c{0}, pieces{0};
++    std::atomic<long long> bytes{0};   // bytes copied by the workaround (1D + 2D pieces)
++    std::atomic<long long> ns{0};      // host time spent in the workaround's submit path
++    ~StageStats() {
++        if (std::getenv("STRATA_SYCL_GEMM_STAGE_STATS") == nullptr) return;
++        std::fprintf(stderr,
++                     "sycl gemm stage: calls %lld, far_a %lld, far_b %lld, far_c %lld, pieces %lld, copied %.1f MiB, "
++                     "host %.0f ms\n",
++                     calls.load(), far_a.load(), far_b.load(), far_c.load(), pieces.load(),
++                     (double) bytes.load() / (1024.0 * 1024.0), (double) ns.load() / 1e6);
++    }
++};
++StageStats& stage_stats() {
++    static StageStats s;
++    return s;
++}
++
+ cublasStatus_t blas_fail(cublasStatus_t status) {
+     fail(cudaErrorUnknown);
+     return status;
+@@ -280,6 +303,19 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cub
+             if (!run(A, B, n, C)) return blas_fail(CUBLAS_STATUS_NOT_SUPPORTED);
+             return CUBLAS_STATUS_SUCCESS;
+         }
++        static const bool stats_on = [] {
++            const char* v = std::getenv("STRATA_SYCL_GEMM_STAGE_STATS");
++            return v && v[0] != '0';
++        }();
++        StageStats* st = stats_on ? &stage_stats() : nullptr;
++        std::chrono::steady_clock::time_point st_t0{};
++        if (st) {
++            st->calls.fetch_add(1);
++            st->far_a.fetch_add(far_a ? 1 : 0);
++            st->far_b.fetch_add(far_b ? 1 : 0);
++            st->far_c.fetch_add(far_c ? 1 : 0);
++            st_t0 = std::chrono::steady_clock::now();
++        }
+         // The staging buffer is the queue's own (a GEMM on another stream must not overwrite it while this one
+         // reads it), grown when an operand needs more: A whole when it is far, B whole when it is far and
+         // transposed (its columns of op(B) are rows of the stored matrix), and at least one column of B and C.
+@@ -292,6 +328,8 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cub
+         const size_t room = std::max(kScratch, a_room + bw_room + per_col);
+         if (far_a) q.memcpy(scratch, A, a_bytes);
+         if (b_whole) q.memcpy(scratch + a_room, B, b_cols * b_col);
++        if (st && far_a) st->bytes.fetch_add((long long) a_bytes);
++        if (st && b_whole) st->bytes.fetch_add((long long) b_cols * b_col);
+         const void* Ause = far_a ? (const void*) scratch : A;
+         const uint8_t* Bbase = b_whole ? scratch + a_room : static_cast<const uint8_t*>(B);
+         // a piece of output columns [c0, c0 + nc): op(B)'s columns c0.. start c0 * ldb elements in for an untransposed
+@@ -310,10 +348,17 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cub
+             // and beta projections share one buffer, interleaved by ldc), and a whole-column copy back wrote the
+             // scratch's stale rows over the other projection's outputs
+             if (far_c && b != 0.0f) q.ext_oneapi_memcpy2d(sc, c_col, Cp, c_col, (size_t) m * sizeof(float), (size_t) nc);
++            if (st) {
++                st->pieces.fetch_add(1);
++                if (far_b && !b_whole) st->bytes.fetch_add((long long) nc * b_col);
++                // memcpy2d copies only m rows, and beta == 0 needs no input C.
++                if (far_c) st->bytes.fetch_add((b != 0.0f ? 2ll : 1ll) * nc * m * sizeof(float));
++            }
+             if (!run(Ause, far_b && !b_whole ? (const void*) sb : (const void*) Bp, nc, far_c ? (void*) sc : Cp))
+                 return blas_fail(CUBLAS_STATUS_NOT_SUPPORTED);
+             if (far_c) q.ext_oneapi_memcpy2d(Cp, c_col, sc, c_col, (size_t) m * sizeof(float), (size_t) nc);
+         }
++        if (st) st->ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - st_t0).count());
+         return CUBLAS_STATUS_SUCCESS;
+     } catch (const sycl::exception& e) {
+         from_exception(e);
+diff --git a/tests/core/file_expert_source_test.cpp b/tests/core/file_expert_source_test.cpp
+index e86acc1..af3b819 100644
+--- a/tests/core/file_expert_source_test.cpp
++++ b/tests/core/file_expert_source_test.cpp
+@@ -220,6 +220,13 @@ void test_resident_lend_region() {
+     require(choose_resident_keep_from(slots, 10, 100, -1) == 4, "no lend region kept slots in RAM");
+     require(choose_resident_keep_from(slots, 10, 100, 9) == 4, "an out-of-range lend region kept slots in RAM");
+     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
++    require(choose_resident_keep_to(slots, 10, 9, 3) == -1, "head: base exceeds budget");
++    require(choose_resident_keep_to(slots, 10, 10, 3) == 0, "head: no space for lent experts");
++    require(choose_resident_keep_to(slots, 10, 15, 3) == 1, "head: first slot kept first");
++    require(choose_resident_keep_to(slots, 10, 17, 3) == 1, "head: stop before a slot exceeding budget");
++    require(choose_resident_keep_to(slots, 10, 18, 3) == 2, "head: two slots fit");
++    require(choose_resident_keep_to(slots, 10, 100, 3) == 3, "head: respect loan endpoint");
++    require(choose_resident_keep_to({}, 0, 0, 0) == 0, "head: empty cache");
+ }
+ 
+ void test_resident_exchange() {
+ CMakeLists.txt                         |  10 +++
+ docs/INTEL_SYCL.md                     |  42 ++++++++++++
+ include/strata/core/expert_source.hpp  |  10 ++-
+ include/strata/prefill/prefill.hpp     |   3 +
+ src/core/expert_source.cpp             |  65 +++++++++++++-----
+ src/prefill/prefill.cpp                |  11 +++
+ src/program/generate.cpp               | 120 ++++++++++++++++++---------------
+ src/sycl_runtime/blas.cpp              |  45 +++++++++++++
+ tests/core/file_expert_source_test.cpp |   7 ++
+ 9 files changed, 241 insertions(+), 72 deletions(-)

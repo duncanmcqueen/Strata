@@ -53,4 +53,44 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);
 
+// ---- W1: exact hierarchical top-k (workspace-taking, spec section 3) ---------------------------------
+//
+// The register selector covers at most 1024 * 33 blocks; this parallel hierarchical selector has no such bound.
+// It is pure arithmetic in the host view: allocate the workspace before any graph capture, keep it alive for the
+// captured execution's lifetime, and pass it per owner/stream.
+constexpr int64_t kQsaTopkTileBlocks = 1024;  ///< score blocks per hierarchical tile
+constexpr int64_t kQsaTopkHistBins = 256;     ///< radix digits per pass
+
+/// Workspace bytes a hierarchical selection of `nq` queries with a physical stride of `max_blocks` needs.
+/// Checked 64-bit arithmetic is the caller's; this is a plain formula shared by every backend.
+inline uint64_t qsa_topk_workspace_bytes(int64_t nq, int64_t max_blocks) {
+    if (nq <= 0 || max_blocks <= 0) return 0;
+    const int64_t tiles = (max_blocks + kQsaTopkTileBlocks - 1) / kQsaTopkTileBlocks;
+    const uint64_t hist = (uint64_t) nq * (uint64_t) tiles * (uint64_t) kQsaTopkHistBins;
+    const uint64_t qtile = (uint64_t) nq * (uint64_t) tiles * 4u;  // gt/eq totals, admit, output start
+    const uint64_t state = (uint64_t) nq * 8u;                     // per-query prefix/above/thr/eq_budget/flags
+    return (hist + qtile + state) * sizeof(int32_t);
+}
+
+/// Exact hierarchical top-k using caller-owned workspace (`workspace_bytes` >= qsa_topk_workspace_bytes).
+/// Returns false (nothing launched, no output written) when the geometry/workspace is unsupported, so the caller
+/// can use the reference selector.  SYCL backend only; other backends do not implement it.
+bool qsa_block_topk_hier(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                         const QsaShapes& s, int32_t* ids, void* stream, void* workspace,
+                         uint64_t workspace_bytes);
+
+/// W2: query-tiled shared-key FP32 scorer, bitwise-identical to qsa_block_scores.  Test/bench entry point;
+/// SYCL backend only.  Returns false (nothing launched) on unsupported geometry.
+bool qsa_block_scores_tiled(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                            int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
+                            int64_t active_blocks);
+
+/// Device-aware top-k dispatch (section 1A) with caller-owned workspace.  On SYCL it consults the device profile
+/// selectors (`STRATA_SYCL_TOPK=reference|legacy|hierarchical|auto`); `auto` uses the established legacy
+/// register kernel for shapes within its capacity and the reference selector beyond it until a long-context
+/// winner is qualified for this exact device.  A null workspace disables the hierarchical path.
+void qsa_block_topk_ws(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                       const QsaShapes& s, int32_t* ids, void* stream, void* workspace, uint64_t workspace_bytes,
+                       int64_t active_blocks);
+
 }  // namespace strata::kernels

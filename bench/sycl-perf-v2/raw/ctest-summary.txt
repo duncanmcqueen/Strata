@@ -1,0 +1,6 @@
+The following tests FAILED:
+	 56 - sycl_platform_memory_test (Failed)
+	 60 - expert_multi_test (Failed)
+Errors while running CTest
+Output from these tests are in: /home/dwmcqueen/Strata/build-sycl/Testing/Temporary/LastTest.log
+Use "--rerun-failed --output-on-failure" to re-run the failed cases verbosely.

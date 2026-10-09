@@ -7,6 +7,9 @@
 // combinations are the two gemm.cu actually launches - bf16 x bf16 -> f32 and
 // f16 x f16 -> f32, both with CUBLAS_COMPUTE_32F; anything else is NOT_SUPPORTED.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <mutex>
 #include <map>
 #include <cstdlib>
@@ -30,6 +33,26 @@ using strata::sycl_runtime::queue_from_stream;
 using strata::sycl_runtime::device_offset_end;
 
 namespace {
+
+// P0 instrumentation: how often the >4 GiB operand workaround fires and how much it
+// copies.  Off unless STRATA_SYCL_GEMM_STAGE_STATS=1; reported at process exit.
+struct StageStats {
+    std::atomic<long long> calls{0}, far_a{0}, far_b{0}, far_c{0}, pieces{0};
+    std::atomic<long long> bytes{0};   // bytes copied by the workaround (1D + 2D pieces)
+    std::atomic<long long> ns{0};      // host time spent in the workaround's submit path
+    ~StageStats() {
+        if (std::getenv("STRATA_SYCL_GEMM_STAGE_STATS") == nullptr) return;
+        std::fprintf(stderr,
+                     "sycl gemm stage: calls %lld, far_a %lld, far_b %lld, far_c %lld, pieces %lld, copied %.1f MiB, "
+                     "host %.0f ms\n",
+                     calls.load(), far_a.load(), far_b.load(), far_c.load(), pieces.load(),
+                     (double) bytes.load() / (1024.0 * 1024.0), (double) ns.load() / 1e6);
+    }
+};
+StageStats& stage_stats() {
+    static StageStats s;
+    return s;
+}
 
 cublasStatus_t blas_fail(cublasStatus_t status) {
     fail(cudaErrorUnknown);
@@ -280,6 +303,19 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cub
             if (!run(A, B, n, C)) return blas_fail(CUBLAS_STATUS_NOT_SUPPORTED);
             return CUBLAS_STATUS_SUCCESS;
         }
+        static const bool stats_on = [] {
+            const char* v = std::getenv("STRATA_SYCL_GEMM_STAGE_STATS");
+            return v && v[0] != '0';
+        }();
+        StageStats* st = stats_on ? &stage_stats() : nullptr;
+        std::chrono::steady_clock::time_point st_t0{};
+        if (st) {
+            st->calls.fetch_add(1);
+            st->far_a.fetch_add(far_a ? 1 : 0);
+            st->far_b.fetch_add(far_b ? 1 : 0);
+            st->far_c.fetch_add(far_c ? 1 : 0);
+            st_t0 = std::chrono::steady_clock::now();
+        }
         // The staging buffer is the queue's own (a GEMM on another stream must not overwrite it while this one
         // reads it), grown when an operand needs more: A whole when it is far, B whole when it is far and
         // transposed (its columns of op(B) are rows of the stored matrix), and at least one column of B and C.
@@ -292,6 +328,8 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cub
         const size_t room = std::max(kScratch, a_room + bw_room + per_col);
         if (far_a) q.memcpy(scratch, A, a_bytes);
         if (b_whole) q.memcpy(scratch + a_room, B, b_cols * b_col);
+        if (st && far_a) st->bytes.fetch_add((long long) a_bytes);
+        if (st && b_whole) st->bytes.fetch_add((long long) b_cols * b_col);
         const void* Ause = far_a ? (const void*) scratch : A;
         const uint8_t* Bbase = b_whole ? scratch + a_room : static_cast<const uint8_t*>(B);
         // a piece of output columns [c0, c0 + nc): op(B)'s columns c0.. start c0 * ldb elements in for an untransposed
@@ -310,10 +348,17 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cub
             // and beta projections share one buffer, interleaved by ldc), and a whole-column copy back wrote the
             // scratch's stale rows over the other projection's outputs
             if (far_c && b != 0.0f) q.ext_oneapi_memcpy2d(sc, c_col, Cp, c_col, (size_t) m * sizeof(float), (size_t) nc);
+            if (st) {
+                st->pieces.fetch_add(1);
+                if (far_b && !b_whole) st->bytes.fetch_add((long long) nc * b_col);
+                // memcpy2d copies only m rows, and beta == 0 needs no input C.
+                if (far_c) st->bytes.fetch_add((b != 0.0f ? 2ll : 1ll) * nc * m * sizeof(float));
+            }
             if (!run(Ause, far_b && !b_whole ? (const void*) sb : (const void*) Bp, nc, far_c ? (void*) sc : Cp))
                 return blas_fail(CUBLAS_STATUS_NOT_SUPPORTED);
             if (far_c) q.ext_oneapi_memcpy2d(Cp, c_col, sc, c_col, (size_t) m * sizeof(float), (size_t) nc);
         }
+        if (st) st->ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - st_t0).count());
         return CUBLAS_STATUS_SUCCESS;
     } catch (const sycl::exception& e) {
         from_exception(e);

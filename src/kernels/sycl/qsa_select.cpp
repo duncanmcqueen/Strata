@@ -2,6 +2,7 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
 
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/sycl_runtime/device_profile.hpp"
 #include <cstdlib>
 #include <cstring>
 
@@ -10,6 +11,7 @@
 
 #include <cfloat>
 #include <cstdio>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 
@@ -384,6 +386,87 @@ void block_topk_reg_kernel(Grid grid, Grid block, void *stream, const float *__r
     });
 }
 
+// W2: query-tiled shared-key FP32 scoring.  A workgroup owns QT queries and strides over blocks, loading each
+// key row once for all QT queries.  The arithmetic is byte-identical to block_scores_kernel (same lane-local
+// expression, the same 16-step xor reduction, per-head ReLU then head sum, the same tail +1e9).  One launch for
+// any nq; supports the active-block bound.
+constexpr int QS_TILE = 8;
+template <int QT>
+void block_scores_tiled_kernel_impl(sycl::nd_item<1> it, Grid grid, Grid block, const float *__restrict__ pooled,
+                                    const float *__restrict__ dead, const float *__restrict__ q_idx,
+                                    const int32_t *__restrict__ steps, int64_t nq, int64_t max_blocks,
+                                    float *__restrict__ out, float *qs, int64_t *s_nkv, int64_t *s_nbid) {
+    const int t = local_x(it, block);
+    const int64_t qtile = group_y(it, grid);
+    const int64_t q0 = qtile * QT;
+    const int64_t nq_t = q0 + QT <= nq ? QT : (nq > q0 ? nq - q0 : 0);
+    for (int64_t i = t; i < nq_t * IDX_HEADS * IDX_DIM; i += block.x)
+        qs[i] = q_idx[q0 * IDX_HEADS * IDX_DIM + i];
+    if (t < QT) {
+        if (q0 + t < nq) {
+            s_nkv[t] = steps[(q0 + t) * kStepCount + kStepNKv];
+            s_nbid[t] = steps[(q0 + t) * kStepCount + kStepNBid];
+        } else {
+            s_nkv[t] = 0;
+            s_nbid[t] = -1;
+        }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    int64_t top = 0;
+    for (int q = 0; q < QT; ++q)
+        top = s_nbid[q] > top ? s_nbid[q] : top;
+    const int lane = t & 31;
+    const int64_t wstride = (int64_t) grid.x * SCORE_WARPS;
+    for (int64_t b = (int64_t) group_x(it, grid) * SCORE_WARPS + (t >> 5); b <= top && b < max_blocks;
+         b += wstride) {
+        const float4 kp = *reinterpret_cast<const float4 *>(pooled + b * IDX_DIM + lane * 4);
+        const float4 kd = *reinterpret_cast<const float4 *>(dead + lane * 4);
+        for (int q = 0; q < QT; ++q) {
+            if (q >= nq_t)
+                break;
+            const int64_t n_bid = s_nbid[q];
+            if (b > n_bid)
+                continue;
+            const float4 k4 = (b == n_bid) ? kd : kp;
+            const float *qp = qs + q * IDX_HEADS * IDX_DIM + lane * 4;
+            float score = 0.0f;
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float4 q4 = *reinterpret_cast<const float4 *>(qp + h * IDX_DIM);
+                float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1)
+                    d += xor_lane(it, d, o);
+                score += d > 0.0f ? d : 0.0f;
+            }
+            if (lane == 0) {
+                if (b == n_bid && s_nkv[q] % R != 0)
+                    score += 1e9f;
+                out[(q0 + q) * max_blocks + b] = score;
+            }
+        }
+    }
+}
+
+template <int QT>
+void block_scores_tiled_kernel(Grid grid, Grid block, void *stream, const float *pooled, const float *dead,
+                               const float *q_idx, const int32_t *steps, int64_t nq, int64_t max_blocks,
+                               float *out) {
+    strata::sycl_runtime::queue_from_stream(stream).submit([&](sycl::handler &h) {
+        sycl::local_accessor<float, 1> l_qs(sycl::range<1>((QT * IDX_HEADS * IDX_DIM)), h);
+        sycl::local_accessor<int64_t, 1> l_nkv(sycl::range<1>(QT), h);
+        sycl::local_accessor<int64_t, 1> l_nbid(sycl::range<1>(QT), h);
+        h.parallel_for(sycl::nd_range<1>(grid.size() * block.size(), block.size()),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           block_scores_tiled_kernel_impl<QT>(
+                               it, grid, block, pooled, dead, q_idx, steps, nq, max_blocks, out,
+                               l_qs.template get_multi_ptr<sycl::access::decorated::no>().get(),
+                               l_nkv.template get_multi_ptr<sycl::access::decorated::no>().get(),
+                               l_nbid.template get_multi_ptr<sycl::access::decorated::no>().get());
+                       });
+    });
+}
+
 // Block scores with every key block read ONCE for all of a call's queries (block_scores_kernel's grid is
 // (max_blocks / 8) x nq: ~24,600 mostly-idle blocks per layer at a decode window, each key re-read per
 // query).  A fixed grid strides over the blocks; per (block, query) the same arithmetic in the same order as
@@ -461,6 +544,380 @@ void block_scores_multi_kernel(Grid grid, Grid block, void *stream, const float 
 
 } // namespace
 
+// =====================================================================================================
+// W1: exact hierarchical top-k (spec section 3).
+//
+// The register selector holds at most 1024*33 blocks; this selector tiles the physical `max_blocks` score-row
+// stride into 1024-block tiles and does four 8-bit radix passes with per-tile histograms (no grid-wide sync inside
+// a kernel), a per-query threshold reduction, a two-level ordered compaction and a per-tile emit that reproduces
+// the reference tie rule (lowest cell IDs, ascending output).  Every buffer lives in caller-owned workspace, so a
+// captured graph replays with no allocation.
+namespace {
+using namespace sycl_kv;
+
+constexpr int HIER_T = 256;                 // work-items per tile (histogram/reduce)
+constexpr int HIER_SCAN_T = 1024;           // work-items for the ordered count/emit scans (32 warps)
+constexpr int64_t HIER_TILE = kQsaTopkTileBlocks;
+
+inline int hier_weight(int64_t b, int64_t n_bid, int64_t n_kv) {
+    return b < n_bid ? R : (int) (n_kv - n_bid * R);
+}
+
+inline int64_t hier_min(int64_t a, int64_t b) { return a < b ? a : b; }
+
+// Per-query state layout in workspace (int32): [0]=prefix [1]=above [2]=digit [3]=thr [4]=eq_budget [5]=identity
+constexpr int ST_PREFIX = 0, ST_ABOVE = 1, ST_DIGIT = 2, ST_THR = 3, ST_EQBUDGET = 4, ST_IDENT = 5;
+
+// init: clear per-query state; write the identity selection when n_kv <= width (scores not read).
+void hier_init_kernel_impl(sycl::nd_item<1> it, Grid grid, Grid block, const int32_t *steps, int64_t cap,
+                           int32_t *ids, int32_t *state) {
+    const int64_t qi = group_x(it, grid);
+    const int t = local_x(it, block);
+    const int32_t *st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], width = st[kStepWidth];
+    const bool ident = n_kv <= width;
+    if (t == 0) {
+        state[qi * 8 + ST_IDENT] = ident ? 1 : 0;
+        state[qi * 8 + ST_PREFIX] = 0;
+        state[qi * 8 + ST_ABOVE] = 0;
+    }
+    if (ident)
+        for (int64_t j = t; j < n_kv; j += HIER_T)
+            ids[qi * cap + j] = (int32_t) j;
+}
+
+// hist: for one tile, histogram the live blocks whose key matches the already-selected prefix, weighting by cells.
+// SHIFT is a compile-time template parameter so each radix pass is its own kernel (constant mask, no runtime arg).
+template <int SHIFT>
+void hier_hist_kernel_impl(sycl::nd_item<1> it, Grid grid, Grid block, const float *scores, const int32_t *steps,
+                           int64_t max_blocks, int64_t tiles, int32_t *hist, int32_t *state, int *l_hist, int *l_st) {
+    const int64_t qi = group_y(it, grid);
+    const int64_t tile = group_x(it, grid);
+    const int t = local_x(it, block);
+    if (state[qi * 8 + ST_IDENT] != 0)
+        return;
+    l_hist[t] = 0;
+    it.barrier(sycl::access::fence_space::local_space);
+    const int32_t *st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    const uint32_t prefix = (uint32_t) state[qi * 8 + ST_PREFIX];
+    constexpr uint32_t hi_mask = SHIFT == 24 ? 0u : (0xffffffffu << (SHIFT + 8));
+    const float *sc = scores + qi * max_blocks;
+    const int64_t b0 = tile * HIER_TILE, b1 = hier_min(b0 + HIER_TILE, max_blocks);
+    for (int64_t b = b0 + t; b < b1; b += HIER_T) {
+        if (b > n_bid)
+            break;
+        const int w = hier_weight(b, n_bid, n_kv);
+        if (w == 0)
+            continue;
+        const uint32_t k = order_key(sc[b]);
+        if ((k & hi_mask) == (prefix & hi_mask))
+            atomic_add(&l_hist[(k >> SHIFT) & 255], w);
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    hist[(qi * tiles + tile) * 256 + t] = l_hist[t];
+}
+
+// reduce: sum tile histograms for one query and pick this pass's digit descending from `above`.
+template <int SHIFT>
+void hier_reduce_kernel_impl(sycl::nd_item<1> it, Grid grid, Grid block, const int32_t *steps, int64_t tiles,
+                             const int32_t *hist, int32_t *state, int *l_hist) {
+    const int64_t qi = group_x(it, grid);
+    const int t = local_x(it, block);
+    if (state[qi * 8 + ST_IDENT] != 0)
+        return;
+    int s = 0;
+    for (int64_t tile = 0; tile < tiles; ++tile)
+        s += hist[(qi * tiles + tile) * 256 + t];
+    l_hist[t] = s;
+    it.barrier(sycl::access::fence_space::local_space);
+    if (t == 0) {
+        const int width = steps[qi * kStepCount + kStepWidth];
+        int cum = state[qi * 8 + ST_ABOVE], d = 255;
+        for (; d > 0; --d) {
+            if (cum + l_hist[d] >= width)
+                break;
+            cum += l_hist[d];
+        }
+        state[qi * 8 + ST_DIGIT] = d;
+        state[qi * 8 + ST_ABOVE] = cum;
+        state[qi * 8 + ST_PREFIX] |= (int32_t) ((uint32_t) d << SHIFT);
+        if (SHIFT == 0)
+            state[qi * 8 + ST_THR] = state[qi * 8 + ST_PREFIX];
+    }
+}
+
+template <int SHIFT>
+void hier_hist_kernel(int64_t nq, int64_t tiles, void *stream, const float *scores, const int32_t *steps,
+                      int64_t max_blocks, int32_t *hist, int32_t *state) {
+    strata::sycl_runtime::queue_from_stream(stream).submit([&](sycl::handler &h) {
+        sycl::local_accessor<int, 1> l_hist(sycl::range<1>(256), h);
+        sycl::local_accessor<int, 1> l_st(sycl::range<1>(4), h);
+        h.parallel_for(
+            sycl::nd_range<1>((size_t) (tiles * nq) * HIER_T, HIER_T),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                hier_hist_kernel_impl<SHIFT>(it, Grid(tiles, nq), HIER_T, scores, steps, max_blocks, tiles, hist,
+                                             state,
+                                             l_hist.template get_multi_ptr<sycl::access::decorated::no>().get(),
+                                             l_st.template get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+    });
+}
+template <int SHIFT>
+void hier_reduce_kernel(int64_t nq, int64_t tiles, void *stream, const int32_t *steps, const int32_t *hist,
+                        int32_t *state) {
+    strata::sycl_runtime::queue_from_stream(stream).submit([&](sycl::handler &h) {
+        sycl::local_accessor<int, 1> l_hist(sycl::range<1>(256), h);
+        h.parallel_for(
+            sycl::nd_range<1>((size_t) nq * HIER_T, HIER_T),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                hier_reduce_kernel_impl<SHIFT>(it, Grid(nq), HIER_T, steps, tiles, hist, state,
+                                               l_hist.template get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+    });
+}
+
+// count: per tile, total cell weights with key > thr (gt) and == thr (eq).
+void hier_count_kernel_impl(sycl::nd_item<1> it, Grid grid, Grid block, const float *scores, const int32_t *steps,
+                            int64_t max_blocks, int64_t tiles, int32_t *qtile, const int32_t *state, int *s_warp,
+                            int *l_st) {
+    const int64_t qi = group_y(it, grid);
+    const int64_t tile = group_x(it, grid);
+    const int t = local_x(it, block);
+    if (state[qi * 8 + ST_IDENT] != 0)
+        return;
+    if (t < 4) {
+        const int32_t *st = steps + qi * kStepCount;
+        l_st[0] = (int) st[kStepNKv];
+        l_st[1] = (int) st[kStepNBid];
+        l_st[2] = state[qi * 8 + ST_THR];
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    const int64_t n_kv = l_st[0], n_bid = l_st[1];
+    const uint32_t thr = (uint32_t) l_st[2];
+    const float *sc = scores + qi * max_blocks;
+    const int64_t per = (HIER_TILE + HIER_SCAN_T - 1) / HIER_SCAN_T;
+    const int64_t b0 = tile * HIER_TILE + (int64_t) t * per;
+    const int64_t b1 = hier_min(hier_min(b0 + per, (tile + 1) * HIER_TILE), max_blocks);
+    int gt = 0, eq = 0;
+    for (int64_t b = b0; b < b1; ++b) {
+        if (b > n_bid)
+            break;
+        const int w = hier_weight(b, n_bid, n_kv);
+        if (w == 0)
+            continue;
+        const uint32_t k = order_key(sc[b]);
+        if (k > thr)
+            gt += w;
+        else if (k == thr)
+            eq += w;
+    }
+    int tot = 0;
+    block_excl_scan(it, gt, s_warp, tot);
+    const int gt_total = tot;
+    block_excl_scan(it, eq, s_warp, tot);
+    if (t == 0) {
+        qtile[(qi * tiles + tile) * 4 + 0] = gt_total;
+        qtile[(qi * tiles + tile) * 4 + 1] = tot;
+    }
+}
+
+// plan: per query, admit tied cells in increasing tile order and assign each tile's output start.
+void hier_plan_kernel_impl(sycl::nd_item<1> it, Grid grid, Grid block, const int32_t *steps, int64_t tiles,
+                           int32_t *qtile, const int32_t *state) {
+    if (local_x(it, block) != 0)
+        return;
+    const int64_t qi = group_x(it, grid);
+    if (state[qi * 8 + ST_IDENT] != 0)
+        return;
+    const int width = steps[qi * kStepCount + kStepWidth];
+    const int above = state[qi * 8 + ST_ABOVE];
+    int running = 0, eq_before = 0;
+    for (int64_t tile = 0; tile < tiles; ++tile) {
+        int32_t *q = qtile + (qi * tiles + tile) * 4;
+        const int gt = q[0], eq = q[1];
+        int avail = width - above - eq_before;
+        if (avail < 0)
+            avail = 0;
+        const int admit = eq < avail ? eq : avail;
+        q[2] = admit;
+        q[3] = running;
+        running += gt + admit;
+        eq_before += eq;
+    }
+}
+
+// emit: write each tile's selected cells in increasing block/cell order into its disjoint output interval.
+void hier_emit_kernel_impl(sycl::nd_item<1> it, Grid grid, Grid block, const float *scores, const int32_t *steps,
+                           int64_t max_blocks, int64_t tiles, int64_t cap, int32_t *ids, const int32_t *state,
+                           const int32_t *qtile, int *s_warp, int *l_st) {
+    const int64_t qi = group_y(it, grid);
+    const int64_t tile = group_x(it, grid);
+    const int t = local_x(it, block);
+    if (state[qi * 8 + ST_IDENT] != 0)
+        return;
+    if (t < 4) {
+        const int32_t *st = steps + qi * kStepCount;
+        l_st[0] = (int) st[kStepNKv];
+        l_st[1] = (int) st[kStepNBid];
+        l_st[2] = state[qi * 8 + ST_THR];
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    const int64_t n_kv = l_st[0], n_bid = l_st[1];
+    const uint32_t thr = (uint32_t) l_st[2];
+    const int32_t *q = qtile + (qi * tiles + tile) * 4;
+    const int admit = q[2];
+    const float *sc = scores + qi * max_blocks;
+    int32_t *out = ids + qi * cap;
+    const int64_t per = (HIER_TILE + HIER_SCAN_T - 1) / HIER_SCAN_T;
+    const int64_t b0 = tile * HIER_TILE + (int64_t) t * per;
+    const int64_t b1 = hier_min(hier_min(b0 + per, (tile + 1) * HIER_TILE), max_blocks);
+    int gt = 0, eq = 0;
+    for (int64_t b = b0; b < b1; ++b) {
+        if (b > n_bid)
+            break;
+        const int w = hier_weight(b, n_bid, n_kv);
+        if (w == 0)
+            continue;
+        const uint32_t k = order_key(sc[b]);
+        if (k > thr)
+            gt += w;
+        else if (k == thr)
+            eq += w;
+    }
+    int tot = 0;
+    const int eq_before = block_excl_scan(it, eq, s_warp, tot);
+    int64_t my_eq = admit - eq_before;
+    if (my_eq < 0)
+        my_eq = 0;
+    if (my_eq > eq)
+        my_eq = eq;
+    const int sel = gt + (int) my_eq;
+    const int64_t wpos0 = block_excl_scan(it, sel, s_warp, tot) + q[3];
+    int64_t wpos = wpos0, eq_left = my_eq;
+    for (int64_t b = b0; b < b1; ++b) {
+        if (b > n_bid)
+            break;
+        const int w = hier_weight(b, n_bid, n_kv);
+        if (w == 0)
+            continue;
+        const uint32_t k = order_key(sc[b]);
+        if (k > thr) {
+            for (int c = 0; c < w; ++c)
+                out[wpos++] = (int32_t) (b * R + c);
+        } else if (k == thr) {
+            for (int c = 0; c < w && eq_left > 0; ++c, --eq_left)
+                out[wpos++] = (int32_t) (b * R + c);
+        }
+    }
+}
+
+void hier_init_kernel(int64_t nq, void *stream, const int32_t *steps, int64_t cap, int32_t *ids, int32_t *state) {
+    strata::sycl_runtime::queue_from_stream(stream).submit([&](sycl::handler &h) {
+        h.parallel_for(sycl::nd_range<1>((size_t) nq * HIER_T, HIER_T),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           hier_init_kernel_impl(it, Grid(nq), HIER_T, steps, cap, ids, state);
+                       });
+    });
+}
+
+void hier_count_kernel(int64_t nq, int64_t tiles, void *stream, const float *scores, const int32_t *steps,
+                       int64_t max_blocks, int32_t *qtile, const int32_t *state) {
+    strata::sycl_runtime::queue_from_stream(stream).submit([&](sycl::handler &h) {
+        sycl::local_accessor<int, 1> s_warp(sycl::range<1>(33), h);
+        sycl::local_accessor<int, 1> l_st(sycl::range<1>(4), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (tiles * nq) * HIER_SCAN_T, HIER_SCAN_T),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           hier_count_kernel_impl(it, Grid(tiles, nq), HIER_SCAN_T, scores, steps, max_blocks, tiles, qtile,
+                                                  state,
+                                                  s_warp.template get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                  l_st.template get_multi_ptr<sycl::access::decorated::no>().get());
+                       });
+    });
+}
+void hier_plan_kernel(int64_t nq, int64_t tiles, void *stream, const int32_t *steps, int32_t *qtile,
+                      const int32_t *state) {
+    strata::sycl_runtime::queue_from_stream(stream).submit([&](sycl::handler &h) {
+        h.parallel_for(sycl::nd_range<1>((size_t) nq, 1), [=](sycl::nd_item<1> it) {
+            hier_plan_kernel_impl(it, Grid(nq), 1, steps, tiles, qtile, state);
+        });
+    });
+}
+void hier_emit_kernel(int64_t nq, int64_t tiles, void *stream, const float *scores, const int32_t *steps,
+                      int64_t max_blocks, int64_t cap, int32_t *ids, const int32_t *state, const int32_t *qtile) {
+    strata::sycl_runtime::queue_from_stream(stream).submit([&](sycl::handler &h) {
+        sycl::local_accessor<int, 1> s_warp(sycl::range<1>(33), h);
+        sycl::local_accessor<int, 1> l_st(sycl::range<1>(4), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (tiles * nq) * HIER_SCAN_T, HIER_SCAN_T),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           hier_emit_kernel_impl(it, Grid(tiles, nq), HIER_SCAN_T, scores, steps, max_blocks, tiles, cap,
+                                                 ids, state, qtile,
+                                                 s_warp.template get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                 l_st.template get_multi_ptr<sycl::access::decorated::no>().get());
+                       });
+    });
+}
+}  // namespace
+
+bool qsa_block_topk_hier(const float *scores, const int32_t *steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                         const QsaShapes &s, int32_t *ids, void *stream, void *workspace, uint64_t workspace_bytes) {
+    if (nq <= 0)
+        return true;
+    if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s))
+        return false;
+    if (max_blocks <= 0 || workspace == nullptr)
+        return false;
+    const uint64_t need = qsa_topk_workspace_bytes(nq, max_blocks);
+    if (need == 0 || workspace_bytes < need)
+        return false;
+    const int64_t tiles = (max_blocks + HIER_TILE - 1) / HIER_TILE;
+    int32_t *hist = static_cast<int32_t *>(workspace);
+    int32_t *qtile = hist + nq * tiles * 256;
+    int32_t *state = qtile + nq * tiles * 4;
+    hier_init_kernel(nq, stream, steps, cap, ids, state);
+    hier_hist_kernel<24>(nq, tiles, stream, scores, steps, max_blocks, hist, state);
+    hier_reduce_kernel<24>(nq, tiles, stream, steps, hist, state);
+    hier_hist_kernel<16>(nq, tiles, stream, scores, steps, max_blocks, hist, state);
+    hier_reduce_kernel<16>(nq, tiles, stream, steps, hist, state);
+    hier_hist_kernel<8>(nq, tiles, stream, scores, steps, max_blocks, hist, state);
+    hier_reduce_kernel<8>(nq, tiles, stream, steps, hist, state);
+    hier_hist_kernel<0>(nq, tiles, stream, scores, steps, max_blocks, hist, state);
+    hier_reduce_kernel<0>(nq, tiles, stream, steps, hist, state);
+    // The last reduce wrote thr (== prefix) into ST_THR for the count/emit kernels.
+    hier_count_kernel(nq, tiles, stream, scores, steps, max_blocks, qtile, state);
+    hier_plan_kernel(nq, tiles, stream, steps, qtile, state);
+    hier_emit_kernel(nq, tiles, stream, scores, steps, max_blocks, cap, ids, state, qtile);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_block_topk_hier: %s\n", cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
+
+namespace {
+// STRATA_SYCL_SCORES parsed once at load time (never during capture).
+int parse_scores_mode() {
+    const char *v = std::getenv("STRATA_SYCL_SCORES");
+    if (v == nullptr || std::string(v) == "auto" || std::string(v).empty()) return 0;
+    const std::string s(v);
+    if (s == "legacy") return 1;
+    if (s == "tiled") return 2;
+    if (s == "xmx") return 3;
+    std::fprintf(stderr, "strata sycl: unknown STRATA_SYCL_SCORES='%s' (legacy|tiled|xmx|auto)\n", v);
+    std::exit(2);
+}
+const int g_scores_mode = parse_scores_mode();
+const char *scores_override() {
+    switch (g_scores_mode) {
+    case 1: return "legacy";
+    case 2: return "tiled";
+    case 3: return "xmx";
+    default: return "";
+    }
+}
+}  // namespace
+
 void qsa_block_scores(const float *pooled, const float *dead, const float *q_idx, const int32_t *steps,
                       int64_t nq, int64_t max_blocks, const QsaShapes &s, float *scores, void *stream,
                       int64_t active_blocks) {
@@ -469,6 +926,36 @@ void qsa_block_scores(const float *pooled, const float *dead, const float *q_idx
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535) {
         std::fprintf(stderr, "qsa_block_scores: unsupported indexer geometry\n");
         std::exit(1);
+    }
+    {
+        using namespace strata::sycl_runtime;
+        const DeviceProfile &d = profile_for_stream(stream);
+        SelectorInput in;
+        in.device = &d;
+        in.shape.queries = nq;
+        in.shape.max_blocks = max_blocks;
+        in.shape.active_blocks = active_blocks;
+        in.shape.cells = max_blocks * R;
+        in.override_value = scores_override();
+        const Choice c = select_scores(in);
+        log_choice_once(d, "scores", c);
+        if (!c.ok) {
+            std::fprintf(stderr, "strata sycl scores: %s\n", c.reason.c_str());
+            std::exit(2);
+        }
+        if (c.kernel == "tiled") {
+            const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+            const Grid grid((unsigned)((reach + SCORE_WARPS - 1) / SCORE_WARPS),
+                            (unsigned)((nq + QS_TILE - 1) / QS_TILE));
+            block_scores_tiled_kernel<QS_TILE>(grid, SCORE_WARPS * 32, (cudaStream_t) stream, pooled, dead, q_idx,
+                                               steps, nq, max_blocks, scores);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "qsa_block_scores tiled: %s\n", cudaGetErrorString(e));
+                std::exit(1);
+            }
+            return;
+        }
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
     static const bool multi = [] {
@@ -546,6 +1033,90 @@ void qsa_block_topk(const float *scores, const int32_t *steps, int64_t nq, int64
     auto e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+namespace {
+// Parsed once at library load, so no getenv runs during graph capture (spec section 1).
+int parse_topk_mode() {
+    const char *v = std::getenv("STRATA_SYCL_TOPK");
+    if (v == nullptr || std::string(v) == "auto" || std::string(v).empty()) return 0;
+    const std::string s(v);
+    if (s == "reference") return 1;
+    if (s == "legacy") return 2;
+    if (s == "hierarchical" || s == "hier") return 3;
+    std::fprintf(stderr, "strata sycl: unknown STRATA_SYCL_TOPK='%s' (reference|legacy|hierarchical|auto)\n", v);
+    std::exit(2);
+}
+const int g_topk_mode = parse_topk_mode();
+const char *topk_override() {
+    switch (g_topk_mode) {
+    case 1: return "reference";
+    case 2: return "legacy";
+    case 3: return "hierarchical";
+    default: return "";
+    }
+}
+}  // namespace
+
+bool qsa_block_scores_tiled(const float *pooled, const float *dead, const float *q_idx, const int32_t *steps,
+                            int64_t nq, int64_t max_blocks, const QsaShapes &s, float *scores, void *stream,
+                            int64_t active_blocks) {
+    if (nq <= 0)
+        return true;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535)
+        return false;
+    const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+    const Grid grid((unsigned)((reach + SCORE_WARPS - 1) / SCORE_WARPS),
+                    (unsigned)((nq + QS_TILE - 1) / QS_TILE));
+    block_scores_tiled_kernel<QS_TILE>(grid, SCORE_WARPS * 32, (cudaStream_t) stream, pooled, dead, q_idx, steps, nq,
+                                       max_blocks, scores);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_block_scores_tiled: %s\n", cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
+
+void qsa_block_topk_ws(const float *scores, const int32_t *steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                       const QsaShapes &s, int32_t *ids, void *stream, void *workspace, uint64_t workspace_bytes,
+                       int64_t active_blocks) {
+    if (nq <= 0)
+        return;
+    if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
+        std::fprintf(stderr, "qsa_block_topk_ws: unsupported geometry or cap\n");
+        std::exit(1);
+    }
+    using namespace strata::sycl_runtime;
+    const DeviceProfile &d = profile_for_stream(stream);
+    SelectorInput in;
+    in.device = &d;
+    in.shape.queries = nq;
+    in.shape.max_blocks = max_blocks;
+    in.shape.active_blocks = active_blocks;
+    in.shape.cells = max_blocks * R;
+    in.shape.width = cap;
+    in.scratch_budget = workspace_bytes;
+    in.override_value = topk_override();
+    const Choice c = select_topk(in);
+    log_choice_once(d, "topk", c);
+    if (!c.ok) {  // an explicit unsupported force must fail before any launch
+        std::fprintf(stderr, "strata sycl topk: %s\n", c.reason.c_str());
+        std::exit(2);
+    }
+    if (c.kernel == "hierarchical" &&
+        qsa_block_topk_hier(scores, steps, nq, max_blocks, cap, s, ids, stream, workspace, workspace_bytes))
+        return;
+    if (c.kernel == "reference") {
+        qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
+        return;
+    }
+    // legacy register selector (reach is within its capacity by construction)
+    block_topk_reg_kernel<TK_PER>((unsigned) nq, TK_T, (cudaStream_t) stream, scores, steps, max_blocks, cap, ids);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_block_topk_ws: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
 }

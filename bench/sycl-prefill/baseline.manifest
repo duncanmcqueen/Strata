@@ -1,0 +1,4 @@
+baseline-short|bench/sycl-prefill/artifacts/prompt_short.ids|auto|MAX_CONTEXT=8192 MAX_NEW=64 STRATA_PREFILL_TIMING=1|
+baseline-8k|bench/sycl-prefill/artifacts/prompt8k2.ids|auto|MAX_CONTEXT=16384 MAX_NEW=64 STRATA_PREFILL_TIMING=1|
+baseline-32k-c8192|bench/sycl-prefill/artifacts/prompt32k.ids|auto:8192|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_TIMING=1|
+baseline-32k-c32768|bench/sycl-prefill/artifacts/prompt32k.ids|auto:32768|MAX_CONTEXT=65536 MAX_NEW=64 STRATA_PREFILL_TIMING=1|

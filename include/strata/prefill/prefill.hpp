@@ -34,6 +34,9 @@ struct PrefillStats {
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
+    double ms_expert_host = 0;      ///< (STRATA_PREFILL_TIMING) host wall inside the FP16 fallback's per-expert product
+    int64_t expert_products = 0;    ///< (STRATA_PREFILL_TIMING) per-expert dequant+GEMM invocations
+    int64_t gemm_calls = 0;         ///< (STRATA_PREFILL_TIMING) m.gemm.f16 calls (2 per fallback expert product)
 };
 
 }  // namespace strata::prefill
